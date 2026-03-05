@@ -1,0 +1,30 @@
+# Ambientes Virtuais e Bibliotecas
+venv/
+env/
+__pycache__/
+*.pyc
+
+# Modelos de Inteligência Artificial e Pesos
+*.pt
+*.onnx
+*.engine
+*.trt
+
+# Vídeos e Imagens
+*.mp4
+*.avi
+*.mkv
+*.jpg
+*.jpeg
+*.png
+
+# Dados e Logs (se você não quiser subir os CSVs de detecção)
+data/*.csv
+*.log
+
+# Arquivos do Sistema Operacional e IDE
+.vscode/
+.idea/
+.DS_Store
+
+nul

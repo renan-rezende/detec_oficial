@@ -1,0 +1,21 @@
+# Interface Gráfica
+customtkinter>=5.2.0
+
+# Visão Computacional
+opencv-python>=4.8.0
+numpy>=1.24.0
+Pillow>=10.0.0
+
+# Análise de Dados
+pandas>=2.0.0
+matplotlib>=3.7.0
+
+# Inferência - TensorRT (Recomendado para GPUs NVIDIA)
+# API nativa - NÃO precisa de PyCUDA!
+nvidia-tensorrt>=10.0.0
+
+# Inferência - ONNX Runtime (Alternativa/Fallback)
+onnxruntime-gpu>=1.16.0
+
+# Build
+pyinstaller>=6.0.0
