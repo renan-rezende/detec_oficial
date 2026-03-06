@@ -61,7 +61,7 @@ CSV_COLUMNS = [
 
 # Configurações padrão do detector
 DEFAULT_CONFIDENCE = 0.5
-DEFAULT_DETECTION_RATE = 5  # Processar 1 a cada 5 frames
+DEFAULT_DETECTION_RATE = 5  # Inferências por segundo (1-10)
 DEFAULT_SCALE_MM_PIXEL = 0.1  # mm/pixel
 DEFAULT_MODEL_INPUT_SIZE = (960, 960)
 

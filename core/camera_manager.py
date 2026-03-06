@@ -25,7 +25,7 @@ class CameraConfig:
         self.name = name
         self.source = source  # Caminho de arquivo, índice webcam, ou URL RTSP
         self.model_path = model_path
-        self.detection_rate = detection_rate  # Processar 1 a cada N frames
+        self.detection_rate = detection_rate  # Inferências por segundo (1-10)
         self.scale_mm_pixel = scale_mm_pixel
         self.confidence = confidence
         self.device = device
@@ -42,6 +42,8 @@ class CameraManager:
         self.queues = {}  # {camera_id: Queue}
         self.stop_flags = {}  # {camera_id: Event}
         self.csv_loggers = {}  # {camera_id: CSVLogger} - um por câmera
+        self.detectors = {}  # {camera_id: Detector} - para atualização em tempo real
+        self.analyzers = {}  # {camera_id: PelletAnalyzer} - para atualização em tempo real
 
         logger.info("CameraManager inicializado")
 
@@ -107,7 +109,7 @@ class CameraManager:
 
     def _process_camera(self, camera_id):
         """
-        Thread de processamento de uma câmera
+        Thread de processamento de uma câmera com controle de FPS baseado em tempo
 
         Args:
             camera_id: ID da câmera
@@ -126,9 +128,11 @@ class CameraManager:
             # Inicializar detector
             logger.info(f"[{config.name}] Carregando modelo...")
             detector = Detector(config.model_path, config.device, config.confidence)
+            self.detectors[camera_id] = detector  # Armazenar para atualização em tempo real
 
             # Inicializar analyzer
             analyzer = PelletAnalyzer(config.scale_mm_pixel)
+            self.analyzers[camera_id] = analyzer  # Armazenar para atualização em tempo real
 
             # Abrir source de vídeo
             logger.info(f"[{config.name}] Abrindo source: {config.source}")
@@ -149,13 +153,13 @@ class CameraManager:
 
             logger.info(f"[{config.name}] Iniciando loop de processamento")
 
-            frame_count = 0
+            # Controle de tempo para FPS
+            last_inference_time = 0
             fps_start_time = time.time()
-            fps_frame_count = 0
-            last_process_time = time.time()
+            fps_inference_count = 0
 
             while not stop_flag.is_set():
-                # Ler frame
+                # Ler frame (continua lendo para esvaziar buffer)
                 ret, frame = cap.read()
 
                 if not ret:
@@ -168,24 +172,21 @@ class CameraManager:
                         logger.error(f"[{config.name}] Erro ao ler frame")
                         break
 
-                frame_count += 1
+                # Controle de FPS baseado em tempo
+                current_time = time.time()
+                target_fps = float(config.detection_rate)
+                min_interval = 1.0 / target_fps if target_fps > 0 else 1.0
 
-                # Aplicar taxa de detecção (processar 1 a cada N frames)
-                if frame_count % config.detection_rate != 0:
-                    continue
+                if (current_time - last_inference_time) < min_interval:
+                    continue  # Pula inferência, mas continua lendo câmera
 
-                # Controle de tempo: adicionar delay para limitar FPS de processamento
-                # Se detection_rate = 1, processar ~1 FPS (1 vez por segundo)
-                # Se detection_rate = 5, processar ~5 FPS (1 vez a cada 0.2s)
-                elapsed = time.time() - last_process_time
-                min_interval = 1.0 / config.detection_rate  # Intervalo mínimo entre processamentos
-
-                if elapsed < min_interval:
-                    time.sleep(min_interval - elapsed)
-
-                last_process_time = time.time()
+                last_inference_time = current_time
 
                 try:
+                    # Verificar se câmera ainda existe (pode ter sido removida)
+                    if camera_id not in self.cameras:
+                        break
+
                     # Inferência
                     mask, inference_time = detector.infer(frame)
 
@@ -193,8 +194,9 @@ class CameraManager:
                     analysis = analyzer.analyze(mask, frame)
 
                     # Salvar no CSV específico desta câmera
-                    csv_logger = self.csv_loggers[camera_id]
-                    csv_logger.log(config.name, analysis)
+                    if camera_id in self.csv_loggers:
+                        csv_logger = self.csv_loggers[camera_id]
+                        csv_logger.log(config.name, analysis)
 
                     # Enviar para Queue (não bloqueante)
                     try:
@@ -215,14 +217,14 @@ class CameraManager:
                         except:
                             pass
 
-                    # Calcular FPS
-                    fps_frame_count += 1
+                    # Calcular FPS real
+                    fps_inference_count += 1
                     if time.time() - fps_start_time >= 5.0:  # A cada 5 segundos
-                        fps = fps_frame_count / (time.time() - fps_start_time)
-                        logger.info(f"[{config.name}] FPS: {fps:.1f}, "
+                        fps = fps_inference_count / (time.time() - fps_start_time)
+                        logger.info(f"[{config.name}] FPS Real: {fps:.1f} (Alvo: {target_fps}), "
                                    f"Inferência: {inference_time:.1f}ms")
                         fps_start_time = time.time()
-                        fps_frame_count = 0
+                        fps_inference_count = 0
 
                 except Exception as e:
                     logger.error(f"[{config.name}] Erro no processamento: {e}")
@@ -235,6 +237,11 @@ class CameraManager:
             # Liberar recursos
             if cap is not None:
                 cap.release()
+            # Limpar referências locais
+            if camera_id in self.detectors:
+                del self.detectors[camera_id]
+            if camera_id in self.analyzers:
+                del self.analyzers[camera_id]
             logger.info(f"[{config.name}] Thread finalizada")
 
     def stop_camera(self, camera_id):
@@ -270,8 +277,52 @@ class CameraManager:
             del self.stop_flags[camera_id]
         if camera_id in self.csv_loggers:
             del self.csv_loggers[camera_id]
+        if camera_id in self.detectors:
+            del self.detectors[camera_id]
+        if camera_id in self.analyzers:
+            del self.analyzers[camera_id]
 
         logger.info(f"Câmera {config.name} parada")
+
+    def update_camera_config(self, camera_id, detection_rate=None, confidence=None, scale_mm_pixel=None):
+        """
+        Atualiza configurações de uma câmera em tempo real
+
+        Args:
+            camera_id: ID da câmera
+            detection_rate: Nova taxa de inferências por segundo (opcional)
+            confidence: Novo nível de confiança 0-1 (opcional)
+            scale_mm_pixel: Nova escala mm/pixel (opcional)
+
+        Returns:
+            bool: True se atualizado com sucesso
+        """
+        if camera_id not in self.cameras:
+            logger.warning(f"Câmera {camera_id} não encontrada para atualização")
+            return False
+
+        config = self.cameras[camera_id]
+
+        # Atualizar taxa de detecção
+        if detection_rate is not None:
+            config.detection_rate = detection_rate
+            logger.info(f"[{config.name}] Taxa de detecção atualizada para {detection_rate} inf/s")
+
+        # Atualizar confiança no detector
+        if confidence is not None:
+            config.confidence = confidence
+            if camera_id in self.detectors:
+                self.detectors[camera_id].confidence = confidence
+                logger.info(f"[{config.name}] Confiança atualizada para {confidence:.0%}")
+
+        # Atualizar escala no analyzer
+        if scale_mm_pixel is not None:
+            config.scale_mm_pixel = scale_mm_pixel
+            if camera_id in self.analyzers:
+                self.analyzers[camera_id].scale = scale_mm_pixel
+                logger.info(f"[{config.name}] Escala atualizada para {scale_mm_pixel} mm/px")
+
+        return True
 
     def get_frame(self, camera_id, timeout=0.1):
         """

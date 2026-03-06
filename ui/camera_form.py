@@ -60,8 +60,8 @@ class CameraFormFrame(ctk.CTkFrame):
         model_browse_btn = ctk.CTkButton(model_frame, text="Procurar", width=90, command=self.browse_model)
         model_browse_btn.pack(side="left")
 
-        # Taxa de detecção
-        self.create_field(form_frame, "Taxa de Detecção por Frame:", 3)
+        # Inferências por segundo
+        self.create_field(form_frame, "Inferências por Segundo:", 3)
         rate_frame = ctk.CTkFrame(form_frame)
         rate_frame.grid(row=3, column=1, padx=10, pady=10, sticky="w")
 
@@ -69,11 +69,11 @@ class CameraFormFrame(ctk.CTkFrame):
         self.rate_slider.set(DEFAULT_DETECTION_RATE)
         self.rate_slider.pack(side="left", padx=(0, 10))
 
-        self.rate_label = ctk.CTkLabel(rate_frame, text=f"1 a cada {int(self.rate_slider.get())} frames")
+        self.rate_label = ctk.CTkLabel(rate_frame, text=f"{int(self.rate_slider.get())} inf/s")
         self.rate_label.pack(side="left")
 
         self.rate_slider.configure(command=lambda v: self.rate_label.configure(
-            text=f"1 a cada {int(v)} frames"))
+            text=f"{int(v)} inf/s"))
 
         # Escala mm/pixel
         self.create_field(form_frame, "Escala (mm/pixel):", 4)
