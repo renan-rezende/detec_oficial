@@ -84,8 +84,18 @@ class PelletDetectorApp(ctk.CTk):
         """Callback ao fechar aplicação"""
         logger.info("Fechando aplicação...")
 
-        # Parar todas as câmeras
+        # Parar todas as câmeras (libera VRAM de cada detector)
         self.camera_manager.stop_all()
+
+        # Limpeza final do CUDA
+        try:
+            import torch
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                torch.cuda.synchronize()
+                logger.info("VRAM totalmente liberada")
+        except Exception as e:
+            logger.warning(f"Erro ao limpar CUDA: {e}")
 
         # Destruir janela
         self.destroy()

@@ -188,7 +188,7 @@ class CameraListFrame(ctk.CTkFrame):
         self.refresh_list()
 
         # Auto-refresh a cada 2 segundos
-        self.after(2000, self.auto_refresh)
+        # self.after(2000, self.auto_refresh)
 
     def refresh_list(self):
         """Atualiza lista de câmeras"""
@@ -324,5 +324,7 @@ class CameraListFrame(ctk.CTkFrame):
 
     def auto_refresh(self):
         """Auto-refresh periódico"""
-        self.refresh_list()
-        self.after(2000, self.auto_refresh)
+        # self.refresh_list()
+        # self.after(2000, self.auto_refresh)
+        
+        pass

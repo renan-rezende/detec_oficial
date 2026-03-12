@@ -47,7 +47,7 @@ class Detector:
             raise
 
     def _load_model(self):
-        """Carrega o modelo (TensorRT ou ONNX Runtime)"""
+        """Carrega o modelo (TensorRT, ONNX ou PyTorch)"""
         model_ext = os.path.splitext(self.model_path)[1].lower()
 
         if model_ext == '.engine':
@@ -55,6 +55,9 @@ class Detector:
 
         elif model_ext == '.onnx':
             self._load_onnx()
+
+        elif model_ext == '.pt':
+            self._load_pytorch()
 
         else:
             raise ValueError(f"Formato de modelo não suportado: {model_ext}")
@@ -110,13 +113,40 @@ class Detector:
 
             # O YOLO gerencia toda a memória e ponteiros automaticamente
             self.model = YOLO(self.model_path, task='segment')
-            
+
             self.model_type = 'tensorrt'
 
-            logger.info("  TensorRT inicializado com sucesso (GPU acelerada via Ultralytics)")
+            # Log do tipo de modelo carregado pelo Ultralytics
+            model_type_info = getattr(self.model, 'type', 'unknown')
+            logger.info(f"  Ultralytics model type: {model_type_info}")
+            logger.info("  TensorRT inicializado com sucesso (GPU CUDA Compute)")
 
         except Exception as e:
             logger.error(f"Erro ao carregar modelo TensorRT via Ultralytics: {e}")
+            raise
+
+    def _load_pytorch(self):
+        """Carrega modelo PyTorch (.pt) usando Ultralytics (YOLO)"""
+        try:
+            if self.device.startswith('cuda'):
+                logger.info("Limpando cache do CUDA...")
+                torch.cuda.empty_cache()
+
+            logger.info(f"Carregando modelo PyTorch via Ultralytics: {self.model_path}")
+            logger.info(f"  Device: {self.device}")
+
+            # O YOLO gerencia o modelo automaticamente
+            self.model = YOLO(self.model_path, task='segment')
+
+            self.model_type = 'pytorch'
+
+            if self.device == 'cpu':
+                logger.info("  PyTorch inicializado com sucesso (CPU)")
+            else:
+                logger.info("  PyTorch inicializado com sucesso (GPU acelerada via Ultralytics)")
+
+        except Exception as e:
+            logger.error(f"Erro ao carregar modelo PyTorch via Ultralytics: {e}")
             raise
 
     def preprocess(self, frame):
@@ -149,9 +179,9 @@ class Detector:
             original_shape = frame.shape[:2]
 
             # Inferência baseada no tipo de modelo
-            if hasattr(self, 'model_type') and self.model_type == 'tensorrt':
+            if hasattr(self, 'model_type') and self.model_type in ('tensorrt', 'pytorch'):
                 # Ultralytics faz pre e pós processamento nativamente
-                mask = self._infer_tensorrt(frame, original_shape)
+                mask = self._infer_ultralytics(frame, original_shape)
             else:
                 # Fluxo antigo de matrizes manuais para ONNX
                 input_tensor = self.preprocess(frame)
@@ -176,20 +206,31 @@ class Detector:
         outputs = self.session.run([output_name], {input_name: input_tensor})
         return outputs[0]
 
-    def _infer_tensorrt(self, frame, original_shape):
-        """Inferência usando YOLO com separação de instâncias para granulometria"""
-        
-        # DICA: Aumentei o max_det para 500! Como é uma esteira de pelotização, 
-        # 100 pelotas por frame (o padrão do YOLO) pode ser pouco.
-        results = self.model.predict(
-            source=frame,
-            device=self.device,  
-            half=True,           
-            conf=self.confidence,
-            max_det=100,         
-            verbose=False,
-            retina_masks=True
-        )
+    def _infer_ultralytics(self, frame, original_shape):
+        """Inferência usando YOLO (TensorRT ou PyTorch) com separação de instâncias para granulometria"""
+
+        if self.model_type == 'tensorrt':
+            # TensorRT: device já está embutido no engine, usar half para máxima performance
+            results = self.model.predict(
+                source=frame,
+                half=True,
+                conf=self.confidence,
+                max_det=100,
+                verbose=False,
+                retina_masks=True
+            )
+        else:
+            # PyTorch: especificar device explicitamente
+            use_half = self.device.startswith('cuda')
+            results = self.model.predict(
+                source=frame,
+                device=self.device,
+                half=use_half,
+                conf=self.confidence,
+                max_det=100,
+                verbose=False,
+                retina_masks=True
+            )
 
         result = results[0]
         # Cria uma tela preta vazia do tamanho da imagem da câmera
@@ -216,9 +257,28 @@ class Detector:
         else:
             return final_mask
 
+    def cleanup(self):
+        """Libera recursos da GPU explicitamente"""
+        try:
+            # Limpar modelo YOLO/TensorRT
+            if hasattr(self, 'model') and self.model is not None:
+                del self.model
+                self.model = None
+                logger.debug("Modelo YOLO/TensorRT liberado")
+
+            # Limpar sessão ONNX
+            if self.session is not None:
+                self.session = None
+                logger.debug("Sessão ONNX liberada")
+
+            # Forçar liberação da VRAM
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                logger.debug("Cache CUDA liberado")
+
+        except Exception as e:
+            logger.warning(f"Erro ao liberar recursos: {e}")
+
     def __del__(self):
-        """Libera recursos"""
-        if self.session is not None:
-            self.session = None
-            logger.debug("Recursos do detector ONNX liberados")
-        # O YOLO/PyTorch lida com a própria coleta de lixo, então não precisamos forçar a limpeza aqui
+        """Destrutor - chama cleanup"""
+        self.cleanup()

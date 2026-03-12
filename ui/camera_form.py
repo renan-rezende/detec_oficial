@@ -134,7 +134,13 @@ class CameraFormFrame(ctk.CTkFrame):
         """Abre diálogo para selecionar modelo"""
         filename = filedialog.askopenfilename(
             title="Selecionar Modelo",
-            filetypes=[("Modelo ONNX", "*.onnx"), ("Modelo TensorRT", "*.engine"), ("Todos", "*.*")]
+            filetypes=[
+                ("Todos os Modelos", "*.pt *.onnx *.engine"),
+                ("Modelo PyTorch", "*.pt"),
+                ("Modelo ONNX", "*.onnx"),
+                ("Modelo TensorRT", "*.engine"),
+                ("Todos", "*.*")
+            ]
         )
         if filename:
             self.model_entry.delete(0, tk.END)
@@ -168,6 +174,17 @@ class CameraFormFrame(ctk.CTkFrame):
             errors.append("Caminho do modelo é obrigatório")
         elif not os.path.exists(model_path):
             errors.append(f"Modelo não encontrado: {model_path}")
+        else:
+            # Validar compatibilidade modelo/dispositivo
+            device_str = self.device_menu.get()
+            model_ext = os.path.splitext(model_path)[1].lower()
+
+            if model_ext == '.engine' and device_str == "CPU":
+                errors.append("Modelos TensorRT (.engine) não podem rodar na CPU.\nUse um modelo .onnx ou .pt para CPU, ou selecione uma GPU.")
+
+            if model_ext == '.pt':
+                # Avisar que .pt será convertido automaticamente pelo YOLO
+                logger.info(f"Modelo PyTorch detectado: {model_path}")
 
         # Escala
         try:
