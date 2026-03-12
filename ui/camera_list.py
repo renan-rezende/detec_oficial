@@ -187,8 +187,8 @@ class CameraListFrame(ctk.CTkFrame):
         # Atualizar lista
         self.refresh_list()
 
-        # Auto-refresh a cada 2 segundos
-        # self.after(2000, self.auto_refresh)
+        # Auto-refresh a cada 3 segundos para atualizar status das câmeras
+        self.after(3000, self.auto_refresh)
 
     def refresh_list(self):
         """Atualiza lista de câmeras"""
@@ -323,8 +323,7 @@ class CameraListFrame(ctk.CTkFrame):
                 messagebox.showerror("Erro", f"Erro ao parar câmera:\n{str(e)}")
 
     def auto_refresh(self):
-        """Auto-refresh periódico"""
-        # self.refresh_list()
-        # self.after(2000, self.auto_refresh)
-        
-        pass
+        """Auto-refresh periódico — atualiza status (Ativo/Parado) das câmeras"""
+        if self.winfo_exists():
+            self.refresh_list()
+            self.after(3000, self.auto_refresh)

@@ -8,6 +8,11 @@ import os
 # Adicionar diretório do projeto ao path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+# Desabilitar chamadas de rede do ultralytics ANTES de qualquer import
+# Obrigatório para ambientes sem internet (servidores industriais)
+os.environ['YOLO_OFFLINE'] = '1'
+os.environ['ULTRALYTICS_OFFLINE'] = '1'
+
 # Configurar logging
 from utils.logger import setup_logger
 logger = setup_logger('PelletDetector')
@@ -33,6 +38,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
-

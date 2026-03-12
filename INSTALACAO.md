@@ -288,6 +288,17 @@ notepad logs\app.log
    - Abrir no Excel para análise
    - Importar em sistema de BI se necessário
 
+## 🏭 Deploy em Produção
+
+Para deploy em servidor industrial sem internet, consulte **[PRODUCAO.md](PRODUCAO.md)**.
+
+Resumo rápido:
+1. `python build_executable.py` → gera `dist/PelletDetector/` (pasta, não .exe único)
+2. Copiar `dist/PelletDetector/` + `RGB_960m_256.pt` + `conv.py` para o servidor
+3. No servidor: `python conv.py` → gera o `.engine` otimizado para a GPU local
+4. Mover o `.engine` para dentro de `dist/PelletDetector/`
+5. Executar `PelletDetector.exe`
+
 ## 🛠️ Manutenção
 
 ### Atualizar Dependências

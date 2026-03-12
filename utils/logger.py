@@ -2,13 +2,14 @@
 Sistema de logging configurado para o aplicativo
 """
 import logging
+import logging.handlers
 import os
 from config import LOG_PATH, LOGS_DIR
 
 
 def setup_logger(name='PelletDetector', level=logging.INFO):
     """
-    Configura e retorna um logger
+    Configura e retorna um logger com rotação de arquivo.
 
     Args:
         name: Nome do logger
@@ -18,8 +19,7 @@ def setup_logger(name='PelletDetector', level=logging.INFO):
         Logger configurado
     """
     # Criar diretório de logs se não existir
-    if not os.path.exists(LOGS_DIR):
-        os.makedirs(LOGS_DIR)
+    os.makedirs(LOGS_DIR, exist_ok=True)
 
     # Criar logger
     logger = logging.getLogger(name)
@@ -35,20 +35,20 @@ def setup_logger(name='PelletDetector', level=logging.INFO):
         datefmt='%Y-%m-%d %H:%M:%S'
     )
 
-    # Handler para arquivo
-    file_handler = logging.FileHandler(LOG_PATH, encoding='utf-8')
-    file_handler.setLevel(level)
-    file_handler.setFormatter(formatter)
-    logger.addHandler(file_handler)
+    def _add(handler):
+        handler.setLevel(level)
+        handler.setFormatter(formatter)
+        logger.addHandler(handler)
+
+    # Handler para arquivo com rotação: máx 5 MB, mantém 5 backups
+    _add(logging.handlers.RotatingFileHandler(
+        LOG_PATH,
+        maxBytes=5 * 1024 * 1024,  # 5 MB
+        backupCount=5,
+        encoding='utf-8'
+    ))
 
     # Handler para console
-    console_handler = logging.StreamHandler()
-    console_handler.setLevel(level)
-    console_handler.setFormatter(formatter)
-    logger.addHandler(console_handler)
+    _add(logging.StreamHandler())
 
     return logger
-
-
-# Logger global do aplicativo
-app_logger = setup_logger()

@@ -13,7 +13,7 @@ from matplotlib.dates import DateFormatter
 import pandas as pd
 import os
 from datetime import datetime, timedelta
-from config import UI_UPDATE_INTERVAL, RANGE_ORDER, RANGE_LABELS
+from config import UI_UPDATE_INTERVAL, RANGE_ORDER, RANGE_LABELS, DATA_DIR
 
 
 logger = logging.getLogger('PelletDetector.detection_view')
@@ -161,14 +161,17 @@ class DetectionViewFrame(ctk.CTkFrame):
             self.info_label.configure(text="A câmera não está mais ativa")
             return
 
-        # Esvaziar queue e pegar APENAS o frame mais recente
-        # Isso evita mostrar frames acumulados rapidamente
+        # Esvaziar queue sem bloqueio e pegar APENAS o frame mais recente
+        # Evita bloquear a thread da UI com múltiplos timeouts em sequência
         data = None
-        while True:
-            new_data = self.camera_manager.get_frame(self.camera_id, timeout=0.01)
-            if new_data is None:
-                break  # Queue vazia
-            data = new_data  # Guardar o último
+        q = self.camera_manager.queues.get(self.camera_id)
+        if q is not None:
+            import queue as _queue
+            while True:
+                try:
+                    data = q.get_nowait()
+                except _queue.Empty:
+                    break
 
         if data is not None:
             frame = data['frame']
@@ -270,7 +273,7 @@ class DetectionViewFrame(ctk.CTkFrame):
 
             # Obter caminho do CSV da câmera
             csv_filename = f"{self.config.name.replace(' ', '_')}.csv"
-            csv_path = os.path.join('data', csv_filename)
+            csv_path = os.path.join(DATA_DIR, csv_filename)
 
             # Verificar se CSV existe
             if not os.path.exists(csv_path):

@@ -11,7 +11,7 @@ import os
 from core.detector import Detector
 from core.pellet_analyzer import PelletAnalyzer
 from core.csv_logger import CSVLogger
-from config import MAX_QUEUE_SIZE
+from config import MAX_QUEUE_SIZE, DATA_DIR
 
 logger = logging.getLogger('PelletDetector.camera_manager')
 
@@ -51,8 +51,8 @@ class CameraManager:
             self.cameras[camera_id] = config
 
             csv_filename = f"{config.name.replace(' ', '_')}.csv"
-            csv_path = os.path.join('data', csv_filename)
-            os.makedirs('data', exist_ok=True)
+            csv_path = os.path.join(DATA_DIR, csv_filename)
+            os.makedirs(DATA_DIR, exist_ok=True)
             self.csv_loggers[camera_id] = CSVLogger(csv_path)
 
             self.queues[camera_id] = queue.Queue(maxsize=MAX_QUEUE_SIZE)
@@ -73,10 +73,21 @@ class CameraManager:
             logger.error(f"Erro ao adicionar câmera: {e}")
             raise
 
+    def _open_capture(self, source):
+        """Abre e configura um VideoCapture. Retorna o objeto ou None."""
+        cap = cv2.VideoCapture(source)
+        if not cap.isOpened():
+            return None
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        return cap
+
     def _process_camera(self, camera_id):
         config = self.cameras[camera_id]
         stop_flag = self.stop_flags[camera_id]
         output_queue = self.queues[camera_id]
+
+        # Captura referência local do csv_logger para evitar race condition no stop_camera
+        csv_logger = self.csv_loggers[camera_id]
 
         logger.info(f"[{config.name}] Thread iniciada")
         cap = None
@@ -94,14 +105,16 @@ class CameraManager:
             except ValueError:
                 source = config.source
 
-            cap = cv2.VideoCapture(source)
-            if not cap.isOpened():
-                raise RuntimeError(f"Não abriu source: {config.source}")
+            is_file = isinstance(source, str) and source.endswith(('.mp4', '.avi', '.mov', '.mkv'))
 
-            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+            # Intervalo de reconexão para câmeras de rede (RTSP/IP)
+            RECONNECT_DELAY = 5.0   # segundos entre tentativas
+
+            cap = self._open_capture(source)
+            if cap is None:
+                raise RuntimeError(f"Não foi possível abrir source: {config.source}")
 
             last_inference_time = 0
-
             fps_start_time = time.time()
             fps_inference_count = 0
 
@@ -109,11 +122,29 @@ class CameraManager:
                 ret, frame = cap.read()
 
                 if not ret:
-                    if isinstance(source, str) and source.endswith(('.mp4', '.avi', '.mov')):
+                    if is_file:
+                        # Arquivo de vídeo terminou — reinicia do começo
                         cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
                         continue
                     else:
-                        break
+                        # Câmera de rede perdeu conexão — tenta reconectar
+                        logger.warning(f"[{config.name}] Conexão perdida. Tentando reconectar em {RECONNECT_DELAY}s...")
+                        cap.release()
+                        cap = None
+
+                        reconnect_count = 0
+                        while not stop_flag.is_set():
+                            stop_flag.wait(timeout=RECONNECT_DELAY)
+                            if stop_flag.is_set():
+                                break
+                            reconnect_count += 1
+                            logger.info(f"[{config.name}] Tentativa de reconexão #{reconnect_count}...")
+                            cap = self._open_capture(source)
+                            if cap is not None:
+                                logger.info(f"[{config.name}] Reconectado com sucesso!")
+                                break
+                            logger.warning(f"[{config.name}] Reconexão #{reconnect_count} falhou.")
+                        continue
 
                 # Ler detection_rate do config a cada iteração (permite update em tempo real)
                 target_fps = float(config.detection_rate)
@@ -129,7 +160,8 @@ class CameraManager:
                     mask, inference_time = detector.infer(frame)
                     analysis = analyzer.analyze(mask, frame)
 
-                    self.csv_loggers[camera_id].log(config.name, analysis)
+                    # Usa referência local — seguro mesmo se stop_camera já executou
+                    csv_logger.log(config.name, analysis)
 
                     data_packet = {
                         'frame': analysis['annotated_frame'],
@@ -147,8 +179,9 @@ class CameraManager:
                             pass
 
                     fps_inference_count += 1
-                    if time.time() - fps_start_time >= 5.0:
-                        fps = fps_inference_count / (time.time() - fps_start_time)
+                    fps_elapsed = time.time() - fps_start_time
+                    if fps_elapsed >= 5.0:
+                        fps = fps_inference_count / fps_elapsed
                         logger.info(f"[{config.name}] FPS Real: {fps:.1f} (Alvo: {target_fps}), "
                                    f"Inferência: {inference_time:.1f}ms")
                         fps_start_time = time.time()
@@ -224,6 +257,8 @@ class CameraManager:
         thread = self.threads.get(camera_id)
         if thread and thread.is_alive():
             thread.join(timeout=5.0)
+            if thread.is_alive():
+                logger.warning(f"[{config.name}] Thread não encerrou em 5s — recursos serão liberados mesmo assim")
 
         # Liberar recursos do detector (VRAM)
         detector = self.detectors.pop(camera_id, None)

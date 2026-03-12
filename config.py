@@ -2,9 +2,16 @@
 Configurações globais do sistema de detecção de pelotas
 """
 import os
+import sys
 
-# Caminhos
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+# BASE_DIR aponta para o diretório do executável (produção) ou do script (dev)
+# Necessário para que data/ e logs/ sejam criados ao lado do .exe, não no diretório temp
+if getattr(sys, 'frozen', False):
+    # Rodando como executável PyInstaller
+    BASE_DIR = os.path.dirname(sys.executable)
+else:
+    # Rodando como script Python
+    BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 MODEL_PATH = os.path.join(BASE_DIR, 'RGB_960m_256.engine')
 DATA_DIR = os.path.join(BASE_DIR, 'data')
 LOGS_DIR = os.path.join(BASE_DIR, 'logs')

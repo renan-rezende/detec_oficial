@@ -1,10 +1,13 @@
 """
 Logger para gravação de detecções em CSV
+Usa csv nativo do Python para escrita (mais eficiente que Pandas para uma linha por vez)
+e Pandas apenas para leitura/análise
 """
-import pandas as pd
+import csv
 import os
 import logging
 import threading
+import pandas as pd
 from datetime import datetime
 from config import CSV_PATH, CSV_COLUMNS, DATA_DIR, RANGE_ORDER
 
@@ -16,12 +19,6 @@ class CSVLogger:
     """Gerencia gravação de estatísticas em CSV"""
 
     def __init__(self, csv_path=CSV_PATH):
-        """
-        Inicializa o logger CSV
-
-        Args:
-            csv_path: Caminho para o arquivo CSV
-        """
         self.csv_path = csv_path
         self.lock = threading.Lock()  # Lock para escrita thread-safe
 
@@ -30,8 +27,9 @@ class CSVLogger:
 
         # Criar CSV com cabeçalho se não existir
         if not os.path.exists(csv_path):
-            df = pd.DataFrame(columns=CSV_COLUMNS)
-            df.to_csv(csv_path, index=False)
+            with open(csv_path, 'w', newline='', encoding='utf-8') as f:
+                writer = csv.writer(f)
+                writer.writerow(CSV_COLUMNS)
             logger.info(f"CSV criado: {csv_path}")
         else:
             logger.info(f"CSV existente encontrado: {csv_path}")
@@ -46,27 +44,24 @@ class CSVLogger:
         """
         try:
             with self.lock:
-                # Preparar dados
                 timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
 
-                row_data = {
-                    'Data': timestamp,
-                    'camera_name': camera_name,
-                    'total_pellets': analysis_result['total_pellets'],
-                    'media': round(analysis_result['media'], 2)
-                }
+                row = [
+                    timestamp,
+                    camera_name,
+                    analysis_result['total_pellets'],
+                    round(analysis_result['media'], 2),
+                ]
 
-                # Adicionar relações das faixas
-                for range_name in RANGE_ORDER:
-                    row_data[range_name] = round(analysis_result['range_relations'][range_name], 4)
+                row.extend(
+                    round(analysis_result['range_relations'][r], 4) for r in RANGE_ORDER
+                )
 
-                # Criar DataFrame com uma linha
-                df_new = pd.DataFrame([row_data])
+                with open(self.csv_path, 'a', newline='', encoding='utf-8') as f:
+                    writer = csv.writer(f)
+                    writer.writerow(row)
 
-                # Append no CSV
-                df_new.to_csv(self.csv_path, mode='a', header=False, index=False)
-
-                logger.debug(f"Registro salvo: {camera_name}, {row_data['total_pellets']} pelotas")
+                logger.debug(f"Registro salvo: {camera_name}, {analysis_result['total_pellets']} pelotas")
 
         except Exception as e:
             logger.error(f"Erro ao gravar CSV: {e}")
@@ -79,11 +74,7 @@ class CSVLogger:
             pandas.DataFrame: Dados do CSV
         """
         try:
-            if os.path.exists(self.csv_path):
-                df = pd.read_csv(self.csv_path)
-                return df
-            else:
-                return pd.DataFrame(columns=CSV_COLUMNS)
+            return pd.read_csv(self.csv_path) if os.path.exists(self.csv_path) else pd.DataFrame(columns=CSV_COLUMNS)
         except Exception as e:
             logger.error(f"Erro ao ler CSV: {e}")
             return pd.DataFrame(columns=CSV_COLUMNS)
@@ -104,10 +95,8 @@ class CSVLogger:
         if df.empty:
             return df
 
-        # Filtrar por câmera
         df_camera = df[df['camera_name'] == camera_name]
 
-        # Aplicar limite
         if limit is not None:
             df_camera = df_camera.tail(limit)
 
@@ -116,9 +105,6 @@ class CSVLogger:
     def get_latest_stats(self, camera_name):
         """
         Obtém últimas estatísticas de uma câmera
-
-        Args:
-            camera_name: Nome da câmera
 
         Returns:
             dict or None: Último registro ou None se não existir
@@ -134,8 +120,9 @@ class CSVLogger:
         """Limpa todo o conteúdo do CSV (mantém cabeçalho)"""
         try:
             with self.lock:
-                df = pd.DataFrame(columns=CSV_COLUMNS)
-                df.to_csv(self.csv_path, index=False)
+                with open(self.csv_path, 'w', newline='', encoding='utf-8') as f:
+                    writer = csv.writer(f)
+                    writer.writerow(CSV_COLUMNS)
                 logger.info("CSV limpo")
         except Exception as e:
             logger.error(f"Erro ao limpar CSV: {e}")

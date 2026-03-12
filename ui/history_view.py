@@ -11,7 +11,7 @@ import pandas as pd
 import os
 import glob
 from datetime import datetime
-from config import HISTORY_UPDATE_INTERVAL
+from config import HISTORY_UPDATE_INTERVAL, DATA_DIR
 
 
 logger = logging.getLogger('PelletDetector.history_view')
@@ -90,7 +90,7 @@ class HistoryViewWindow(ctk.CTkToplevel):
         """Atualiza dados lendo TODOS os CSVs da pasta data/"""
         try:
             # Ler TODOS os CSVs da pasta data/
-            csv_files = glob.glob(os.path.join('data', '*.csv'))
+            csv_files = glob.glob(os.path.join(DATA_DIR, '*.csv'))
 
             if not csv_files:
                 self.show_empty_message()
@@ -174,8 +174,12 @@ class HistoryViewWindow(ctk.CTkToplevel):
         self.ax.set_title('Evolução Temporal do Tamanho Médio das Pelotas',
                          color='white', fontsize=14, fontweight='bold', pad=20)
 
-        # Formatar datas no eixo X
-        date_format = DateFormatter("%H:%M:%S")
+        # Formatar datas no eixo X — adapta ao span real dos dados
+        time_span = df['Data'].max() - df['Data'].min()
+        if time_span.total_seconds() < 86400:  # menos de 1 dia
+            date_format = DateFormatter("%H:%M:%S")
+        else:
+            date_format = DateFormatter("%d/%m %H:%M")
         self.ax.xaxis.set_major_formatter(date_format)
         self.fig.autofmt_xdate()
 

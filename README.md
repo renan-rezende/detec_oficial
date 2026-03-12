@@ -229,13 +229,16 @@ Para criar um executável standalone:
 python build_executable.py
 ```
 
-O executável será gerado em `dist/PelletDetector.exe`.
+O executável será gerado na pasta `dist/PelletDetector/`.
 
-**Nota**: O arquivo pode ser grande (200-500MB) devido às dependências.
+> ⚠️ **Atenção**: O build gera uma **pasta** (`--onedir`), não um arquivo único.
+> Isso é obrigatório para aplicações com CUDA/TensorRT — copie a **pasta inteira** para o servidor.
+> Consulte [PRODUCAO.md](PRODUCAO.md) para o processo completo de deploy.
 
 ## 📝 Logs
 
-Logs são gravados em `logs/app.log` com informações sobre:
+Logs são gravados em `logs/app.log` com rotação automática (máx 5 MB × 5 arquivos).
+Informações registradas:
 - Carregamento de modelos
 - FPS de processamento por câmera
 - Erros e exceções
@@ -299,6 +302,8 @@ A taxa de detecção controla quantos frames são processados:
 
 ## 📚 Documentação Adicional
 
+- **PRODUCAO.md** - Guia completo de deploy em servidor industrial
+- **INSTALACAO.md** - Guia de instalação do ambiente de desenvolvimento
 - **MUDANCAS_SEGMENTACAO.md** - Detalhes da implementação com máscaras
 - **MUDANCA_CSV_POR_CAMERA.md** - Detalhes do CSV separado por câmera
 - **logs/app.log** - Logs em tempo real do sistema
@@ -351,7 +356,7 @@ Para problemas ou dúvidas:
 
 ---
 
-**Status**: ✅ Sistema completo e funcional
+**Status**: ✅ Sistema completo, funcional e preparado para produção
 
 **Desenvolvido com**:
 - Python 3.8+
