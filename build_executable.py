@@ -52,6 +52,12 @@ def build():
         # Ultralytics e dependências (modelos YOLO, configs, etc.)
         '--collect-all=ultralytics',
 
+        # TensorRT — inclui as DLLs nativas (sem isso: "DLL load failed while importing tensorrt")
+        # Nomes dos módulos Python (não dos pacotes pip)
+        '--collect-all=tensorrt',
+        '--collect-all=tensorrt_libs',    # tensorrt-cu13-libs
+        '--collect-all=tensorrt_bindings', # tensorrt-cu13-bindings
+
         # Coletar dados do torch (necessário para TensorRT via Ultralytics)
         '--collect-data=torch',
 

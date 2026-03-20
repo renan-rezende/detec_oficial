@@ -70,6 +70,8 @@ CSV_COLUMNS = [
 DEFAULT_CONFIDENCE = 0.5
 DEFAULT_DETECTION_RATE = 5  # Inferências por segundo (1-10)
 DEFAULT_SCALE_MM_PIXEL = 0.1  # mm/pixel
+DEFAULT_MAX_DET = 100  # Máximo de detecções por frame
+DEFAULT_ROI = None  # ROI (x, y, w, h) ou None para frame inteiro
 DEFAULT_MODEL_INPUT_SIZE = (960, 960)
 
 # Configurações de UI

@@ -46,12 +46,12 @@ def test_tensorrt():
 
         # Executar inferencia
         print("[...] Executando inferencia...")
-        mask, inference_time = detector.infer(test_frame)
+        result, inference_time = detector.infer(test_frame)
 
         print(f"[OK] Inferencia OK!")
         print(f"  - Tempo: {inference_time:.2f}ms")
-        print(f"  - Mask shape: {mask.shape}")
-        print(f"  - Mask min/max: {mask.min()}/{mask.max()}")
+        num_masks = len(result.masks.data) if result.masks is not None else 0
+        print(f"  - Mascaras detectadas: {num_masks}")
 
         # Benchmark
         print("\n[...] Benchmark (10 inferencias)...")

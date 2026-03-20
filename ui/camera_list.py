@@ -4,6 +4,7 @@ Lista de câmeras ativas
 import customtkinter as ctk
 import logging
 from tkinter import messagebox
+from ui.roi_dialog import ROIDialog
 
 
 logger = logging.getLogger('PelletDetector.camera_list')
@@ -21,13 +22,13 @@ class EditCameraDialog(ctk.CTkToplevel):
 
         # Configurar janela
         self.title(f"Editar Câmera: {config.name}")
-        self.geometry("450x450")
+        self.geometry("450x620")
         self.resizable(False, False)
 
         # Centralizar na tela
         self.update_idletasks()
         x = (self.winfo_screenwidth() - 450) // 2
-        y = (self.winfo_screenheight() - 450) // 2
+        y = (self.winfo_screenheight() - 620) // 2
         self.geometry(f"+{x}+{y}")
 
         # Tornar modal
@@ -94,6 +95,41 @@ class EditCameraDialog(ctk.CTkToplevel):
         self.scale_entry.insert(0, str(config.scale_mm_pixel))
         self.scale_entry.pack(anchor="w", pady=5)
 
+        # Máximo de detecções por frame
+        max_det_frame = ctk.CTkFrame(main_frame)
+        max_det_frame.pack(fill="x", pady=10)
+
+        ctk.CTkLabel(max_det_frame, text="Máx. Detecções por Frame:",
+                    font=ctk.CTkFont(size=13, weight="bold")).pack(anchor="w")
+
+        self.max_det_entry = ctk.CTkEntry(max_det_frame, width=150)
+        self.max_det_entry.insert(0, str(getattr(config, 'max_det', 100)))
+        self.max_det_entry.pack(anchor="w", pady=5)
+
+        # Região de Interesse (ROI)
+        roi_section = ctk.CTkFrame(main_frame)
+        roi_section.pack(fill="x", pady=10)
+
+        ctk.CTkLabel(roi_section, text="Região de Interesse (ROI):",
+                     font=ctk.CTkFont(size=13, weight="bold")).pack(anchor="w")
+
+        roi_control = ctk.CTkFrame(roi_section)
+        roi_control.pack(fill="x", pady=5)
+
+        current_roi = getattr(config, 'roi', None)
+        roi_text = f"ROI: ({current_roi[0]}, {current_roi[1]}) {current_roi[2]}x{current_roi[3]}" if current_roi else "Não definida (frame inteiro)"
+        self.roi_status = ctk.CTkLabel(roi_control, text=roi_text)
+        self.roi_status.pack(side="left", padx=(0, 10))
+
+        ctk.CTkButton(roi_control, text="Definir ROI", width=110,
+                       command=self._open_roi_dialog).pack(side="left", padx=3)
+
+        ctk.CTkButton(roi_control, text="Limpar ROI", width=100,
+                       command=self._clear_roi,
+                       fg_color="gray", hover_color="darkgray").pack(side="left", padx=3)
+
+        self._pending_roi = '_unchanged'  # Sentinela: não alterar ROI por padrão
+
         # Status label
         self.status_label = ctk.CTkLabel(main_frame, text="", text_color="green")
         self.status_label.pack(pady=5)
@@ -113,6 +149,37 @@ class EditCameraDialog(ctk.CTkToplevel):
                                   fg_color="#555555", hover_color="#333333")
         close_btn.pack(side="left", padx=10)
 
+    def _open_roi_dialog(self):
+        """Abre diálogo de seleção de ROI usando frame da câmera ativa"""
+        data = self.camera_manager.get_frame(self.camera_id, timeout=0.5)
+        if data is not None:
+            frame = data['frame']
+        else:
+            # Fallback: abrir source diretamente
+            from ui.roi_dialog import grab_sample_frame
+            frame = grab_sample_frame(self.config.source)
+
+        if frame is None:
+            messagebox.showerror("Erro", "Não foi possível capturar frame da câmera.")
+            return
+
+        current = getattr(self.config, 'roi', None)
+        ROIDialog(self, frame, current_roi=current, on_apply=self._on_roi_applied)
+
+    def _on_roi_applied(self, roi):
+        """Callback quando ROI é definida ou limpa pelo diálogo"""
+        self._pending_roi = roi
+        if roi is not None:
+            x, y, w, h = roi
+            self.roi_status.configure(text=f"ROI: ({x}, {y}) {w}x{h}")
+        else:
+            self.roi_status.configure(text="Não definida (frame inteiro)")
+
+    def _clear_roi(self):
+        """Limpa ROI"""
+        self._pending_roi = None
+        self.roi_status.configure(text="Não definida (frame inteiro)")
+
     def apply_changes(self):
         """Aplica as alterações sem fechar o diálogo"""
         try:
@@ -120,6 +187,16 @@ class EditCameraDialog(ctk.CTkToplevel):
             scale = float(self.scale_entry.get())
             if scale <= 0:
                 messagebox.showerror("Erro", "Escala deve ser maior que zero")
+                return
+
+            # Validar max_det
+            try:
+                max_det = int(self.max_det_entry.get())
+                if max_det <= 0:
+                    messagebox.showerror("Erro", "Máx. detecções deve ser maior que zero")
+                    return
+            except ValueError:
+                messagebox.showerror("Erro", "Máx. detecções inválido (use número inteiro)")
                 return
 
             # Obter valores
@@ -131,7 +208,9 @@ class EditCameraDialog(ctk.CTkToplevel):
                 self.camera_id,
                 detection_rate=detection_rate,
                 confidence=confidence,
-                scale_mm_pixel=scale
+                scale_mm_pixel=scale,
+                max_det=max_det,
+                roi=self._pending_roi
             )
 
             if success:
@@ -184,6 +263,10 @@ class CameraListFrame(ctk.CTkFrame):
         self.scrollable_frame = ctk.CTkScrollableFrame(self, label_text="")
         self.scrollable_frame.pack(fill="both", expand=True, padx=20, pady=(0, 20))
 
+        # Referências aos labels de status para atualização sem reconstruir a lista
+        self._status_labels = {}   # camera_id -> CTkLabel
+        self._displayed_ids = set()  # IDs atualmente exibidos
+
         # Atualizar lista
         self.refresh_list()
 
@@ -191,25 +274,23 @@ class CameraListFrame(ctk.CTkFrame):
         self.after(3000, self.auto_refresh)
 
     def refresh_list(self):
-        """Atualiza lista de câmeras"""
-        # Limpar widgets existentes
+        """Reconstrói toda a lista de câmeras (scroll é resetado)."""
+        self._status_labels.clear()
+        self._displayed_ids.clear()
+
         for widget in self.scrollable_frame.winfo_children():
             widget.destroy()
 
-        # Obter lista de câmeras
-        cameras = self.camera_manager.list_cameras()
-
-        if not cameras:
-            # Nenhuma câmera
+        if cameras := self.camera_manager.list_cameras():
+            for camera_id, config in cameras:
+                self.create_camera_item(camera_id, config)
+                self._displayed_ids.add(camera_id)
+        else:
             empty_label = ctk.CTkLabel(self.scrollable_frame,
                                       text="Nenhuma câmera adicionada\n\nClique em 'Adicionar Câmera' para começar",
                                       font=ctk.CTkFont(size=16),
                                       text_color="gray")
             empty_label.pack(pady=100)
-        else:
-            # Mostrar câmeras
-            for camera_id, config in cameras:
-                self.create_camera_item(camera_id, config)
 
     def create_camera_item(self, camera_id, config):
         """
@@ -248,6 +329,9 @@ class CameraListFrame(ctk.CTkFrame):
                                    font=ctk.CTkFont(size=13),
                                    text_color=status_color)
         status_label.pack(anchor="w")
+
+        # Guardar referência para atualização sem reconstruir a lista
+        self._status_labels[camera_id] = status_label
 
         # Botões
         btn_frame = ctk.CTkFrame(item_frame)
@@ -323,7 +407,24 @@ class CameraListFrame(ctk.CTkFrame):
                 messagebox.showerror("Erro", f"Erro ao parar câmera:\n{str(e)}")
 
     def auto_refresh(self):
-        """Auto-refresh periódico — atualiza status (Ativo/Parado) das câmeras"""
-        if self.winfo_exists():
+        """Auto-refresh periódico — atualiza apenas os status sem resetar o scroll."""
+        if not self.winfo_exists():
+            return
+
+        current_ids = {cid for cid, _ in self.camera_manager.list_cameras()}
+
+        if current_ids != self._displayed_ids:
+            # Lista mudou (câmera adicionada ou removida) — reconstrói tudo
             self.refresh_list()
-            self.after(3000, self.auto_refresh)
+        else:
+            # Só atualiza os labels de status — scroll não é alterado
+            for camera_id, status_label in list(self._status_labels.items()):
+                if not status_label.winfo_exists():
+                    continue
+                is_running = self.camera_manager.is_running(camera_id)
+                status_label.configure(
+                    text="🟢 Ativo" if is_running else "🔴 Parado",
+                    text_color="green" if is_running else "red"
+                )
+
+        self.after(3000, self.auto_refresh)

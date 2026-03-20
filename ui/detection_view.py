@@ -185,9 +185,10 @@ class DetectionViewFrame(ctk.CTkFrame):
             self.update_bar_graph(analysis['range_relations'])
 
             # Atualizar info
+            roi_indicator = " | ROI: ativo" if getattr(self.config, 'roi', None) else ""
             info_text = (f"Pelotas: {analysis['total_pellets']} | "
                         f"Média: {analysis['media']:.1f}mm | "
-                        f"Inferência: {inference_time:.1f}ms")
+                        f"Inferência: {inference_time:.1f}ms{roi_indicator}")
             self.info_label.configure(text=info_text)
 
         # Continuar polling

@@ -8,7 +8,8 @@ import os
 import logging
 from core.camera_manager import CameraConfig
 from utils.gpu_utils import get_gpu_options, parse_device_option
-from config import MODEL_PATH, DEFAULT_DETECTION_RATE, DEFAULT_SCALE_MM_PIXEL, DEFAULT_CONFIDENCE
+from config import MODEL_PATH, DEFAULT_DETECTION_RATE, DEFAULT_SCALE_MM_PIXEL, DEFAULT_CONFIDENCE, DEFAULT_MAX_DET
+from ui.roi_dialog import ROIDialog, grab_sample_frame
 
 
 logger = logging.getLogger('PelletDetector.camera_form')
@@ -95,12 +96,37 @@ class CameraFormFrame(ctk.CTkFrame):
 
         self.conf_slider.configure(command=lambda v: self.conf_label.configure(text=f"{int(v)}%"))
 
+        # Máximo de detecções por frame
+        self.create_field(form_frame, "Máx. Detecções por Frame:", 6)
+        self.max_det_entry = ctk.CTkEntry(form_frame, width=150, placeholder_text="Ex: 100")
+        self.max_det_entry.insert(0, str(DEFAULT_MAX_DET))
+        self.max_det_entry.grid(row=6, column=1, padx=10, pady=10, sticky="w")
+
         # Dispositivo (GPU/CPU)
-        self.create_field(form_frame, "Dispositivo:", 6)
+        self.create_field(form_frame, "Dispositivo:", 7)
         self.device_options = get_gpu_options()
         self.device_menu = ctk.CTkOptionMenu(form_frame, values=self.device_options, width=400)
         self.device_menu.set(self.device_options[0])
-        self.device_menu.grid(row=6, column=1, padx=10, pady=10, sticky="w")
+        self.device_menu.grid(row=7, column=1, padx=10, pady=10, sticky="w")
+
+        # Região de Interesse (ROI)
+        self.create_field(form_frame, "Região de Interesse:", 8)
+        roi_frame = ctk.CTkFrame(form_frame)
+        roi_frame.grid(row=8, column=1, padx=10, pady=10, sticky="w")
+
+        self.roi_status_label = ctk.CTkLabel(roi_frame, text="Não definida (frame inteiro)")
+        self.roi_status_label.pack(side="left", padx=(0, 10))
+
+        roi_btn = ctk.CTkButton(roi_frame, text="Definir ROI", width=120,
+                                command=self.open_roi_dialog)
+        roi_btn.pack(side="left", padx=(0, 5))
+
+        roi_clear_btn = ctk.CTkButton(roi_frame, text="Limpar", width=80,
+                                       command=self.clear_roi,
+                                       fg_color="gray", hover_color="darkgray")
+        roi_clear_btn.pack(side="left")
+
+        self.roi_value = None
 
         # Botões
         button_frame = ctk.CTkFrame(self)
@@ -129,6 +155,34 @@ class CameraFormFrame(ctk.CTkFrame):
         if filename:
             self.source_entry.delete(0, tk.END)
             self.source_entry.insert(0, filename)
+
+    def open_roi_dialog(self):
+        """Abre diálogo para definir ROI"""
+        source = self.source_entry.get().strip()
+        if not source:
+            messagebox.showwarning("Aviso", "Informe o caminho da câmera antes de definir o ROI.")
+            return
+
+        frame = grab_sample_frame(source)
+        if frame is None:
+            messagebox.showerror("Erro", f"Não foi possível capturar frame da fonte:\n{source}")
+            return
+
+        ROIDialog(self, frame, current_roi=self.roi_value, on_apply=self._on_roi_applied)
+
+    def _on_roi_applied(self, roi):
+        """Callback quando ROI é definida ou limpa"""
+        self.roi_value = roi
+        if roi is not None:
+            x, y, w, h = roi
+            self.roi_status_label.configure(text=f"ROI: ({x}, {y}) {w}x{h}")
+        else:
+            self.roi_status_label.configure(text="Não definida (frame inteiro)")
+
+    def clear_roi(self):
+        """Limpa a ROI"""
+        self.roi_value = None
+        self.roi_status_label.configure(text="Não definida (frame inteiro)")
 
     def browse_model(self):
         """Abre diálogo para selecionar modelo"""
@@ -194,6 +248,14 @@ class CameraFormFrame(ctk.CTkFrame):
         except ValueError:
             errors.append("Escala inválida (use número decimal)")
 
+        # Max det
+        try:
+            max_det = int(self.max_det_entry.get())
+            if max_det <= 0:
+                errors.append("Máx. detecções deve ser maior que zero")
+        except ValueError:
+            errors.append("Máx. detecções inválido (use número inteiro)")
+
         return errors
 
     def add_camera(self):
@@ -213,6 +275,7 @@ class CameraFormFrame(ctk.CTkFrame):
             detection_rate = int(self.rate_slider.get())
             scale_mm_pixel = float(self.scale_entry.get())
             confidence = self.conf_slider.get() / 100.0
+            max_det = int(self.max_det_entry.get())
             device_str = self.device_menu.get()
             device = parse_device_option(device_str)
 
@@ -224,7 +287,9 @@ class CameraFormFrame(ctk.CTkFrame):
                 detection_rate=detection_rate,
                 scale_mm_pixel=scale_mm_pixel,
                 confidence=confidence,
-                device=device
+                device=device,
+                max_det=max_det,
+                roi=self.roi_value
             )
 
             # Adicionar ao manager

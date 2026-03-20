@@ -11,12 +11,15 @@ import os
 from core.detector import Detector
 from core.pellet_analyzer import PelletAnalyzer
 from core.csv_logger import CSVLogger
+from datetime import datetime
 from config import MAX_QUEUE_SIZE, DATA_DIR
+
+FRAMES_DIR = os.path.join(DATA_DIR, 'frames_segmentados')
 
 logger = logging.getLogger('PelletDetector.camera_manager')
 
 class CameraConfig:
-    def __init__(self, name, source, model_path, detection_rate, scale_mm_pixel, confidence, device):
+    def __init__(self, name, source, model_path, detection_rate, scale_mm_pixel, confidence, device, max_det=100, roi=None):
         self.name = name
         self.source = source
         self.model_path = model_path
@@ -24,6 +27,8 @@ class CameraConfig:
         self.scale_mm_pixel = scale_mm_pixel
         self.confidence = confidence
         self.device = device
+        self.max_det = max_det
+        self.roi = roi  # (x, y, w, h) ou None para frame inteiro
         self.id = str(uuid.uuid4())[:8]
 
 class CameraManager:
@@ -93,7 +98,7 @@ class CameraManager:
         cap = None
 
         try:
-            detector = Detector(config.model_path, config.device, config.confidence)
+            detector = Detector(config.model_path, config.device, config.confidence, config.max_det)
             analyzer = PelletAnalyzer(config.scale_mm_pixel)
 
             # Guardar referências para update em tempo real
@@ -118,8 +123,19 @@ class CameraManager:
             fps_start_time = time.time()
             fps_inference_count = 0
 
+            # Acumuladores para relatório de desempenho por etapa
+            acc_frame_read_ms = 0.0
+            acc_infer_ms = 0.0
+            acc_analyze_ms = 0.0
+            acc_csv_ms = 0.0
+            acc_disk_ms = 0.0
+            acc_queue_ms = 0.0
+            acc_total_pipeline_ms = 0.0
+
             while not stop_flag.is_set():
+                t_read_start = time.perf_counter()
                 ret, frame = cap.read()
+                t_read_ms = (time.perf_counter() - t_read_start) * 1000
 
                 if not ret:
                     if is_file:
@@ -155,20 +171,75 @@ class CameraManager:
                     continue
 
                 last_inference_time = current_time
+                t_pipeline_start = time.perf_counter()
 
                 try:
-                    mask, inference_time = detector.infer(frame)
-                    analysis = analyzer.analyze(mask, frame)
+                    # --- ROI: recortar frame para inferência ---
+                    roi = config.roi  # (x, y, w, h) ou None
+                    full_frame = frame
 
-                    # Usa referência local — seguro mesmo se stop_camera já executou
+                    if roi is not None:
+                        rx, ry, rw, rh = roi
+                        fh, fw = frame.shape[:2]
+                        rx = max(0, min(rx, fw - 1))
+                        ry = max(0, min(ry, fh - 1))
+                        rw = min(rw, fw - rx)
+                        rh = min(rh, fh - ry)
+                        if rw > 10 and rh > 10:
+                            inference_frame = frame[ry:ry+rh, rx:rx+rw]
+                        else:
+                            roi = None
+                            inference_frame = frame
+                    else:
+                        inference_frame = frame
+
+                    # --- Inferência ---
+                    t_infer_start = time.perf_counter()
+                    result, inference_time = detector.infer(inference_frame)
+                    t_infer_ms = (time.perf_counter() - t_infer_start) * 1000
+
+                    # --- Análise (pós-processamento) ---
+                    t_analyze_start = time.perf_counter()
+                    analysis = analyzer.analyze(result, inference_frame)
+                    t_analyze_ms = (time.perf_counter() - t_analyze_start) * 1000
+
+                    # --- ROI: remapear coordenadas e compor no frame completo ---
+                    if roi is not None:
+                        rx, ry, rw, rh = roi
+                        for pellet in analysis['pellets']:
+                            cx, cy = pellet['center']
+                            pellet['center'] = (cx + rx, cy + ry)
+
+                        display_frame = full_frame.copy()
+                        if analysis['annotated_frame'] is not None:
+                            display_frame[ry:ry+rh, rx:rx+rw] = analysis['annotated_frame']
+                        cv2.rectangle(display_frame, (rx, ry), (rx+rw-1, ry+rh-1), (0, 255, 255), 2)
+                        analysis['annotated_frame'] = display_frame
+
+                    # --- Log CSV ---
+                    t_csv_start = time.perf_counter()
                     csv_logger.log(config.name, analysis)
+                    t_csv_ms = (time.perf_counter() - t_csv_start) * 1000
 
+                    # --- Salvar frame segmentado em disco ---
+                    t_disk_start = time.perf_counter()
+                    try:
+                        cam_frames_dir = os.path.join(FRAMES_DIR, config.name)
+                        os.makedirs(cam_frames_dir, exist_ok=True)
+                        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S_%f')
+                        frame_path = os.path.join(cam_frames_dir, f'{timestamp}.jpg')
+                        cv2.imwrite(frame_path, analysis['annotated_frame'])
+                    except Exception as e:
+                        logger.warning(f"[{config.name}] Erro ao salvar frame segmentado: {e}")
+                    t_disk_ms = (time.perf_counter() - t_disk_start) * 1000
+
+                    # --- Enviar para fila UI ---
+                    t_queue_start = time.perf_counter()
                     data_packet = {
                         'frame': analysis['annotated_frame'],
                         'analysis': analysis,
                         'inference_time': inference_time
                     }
-
                     try:
                         output_queue.put_nowait(data_packet)
                     except queue.Full:
@@ -177,15 +248,69 @@ class CameraManager:
                             output_queue.put_nowait(data_packet)
                         except queue.Empty:
                             pass
+                    t_queue_ms = (time.perf_counter() - t_queue_start) * 1000
+
+                    t_pipeline_ms = (time.perf_counter() - t_pipeline_start) * 1000
+
+                    # Log detalhado por frame (DEBUG)
+                    logger.debug(
+                        f"[{config.name}] PIPELINE: "
+                        f"read={t_read_ms:.1f}ms | "
+                        f"infer={t_infer_ms:.1f}ms | "
+                        f"analyze={t_analyze_ms:.1f}ms | "
+                        f"csv={t_csv_ms:.1f}ms | "
+                        f"disk={t_disk_ms:.1f}ms | "
+                        f"queue={t_queue_ms:.1f}ms | "
+                        f"total={t_pipeline_ms:.1f}ms | "
+                        f"pellets={analysis['total_pellets']}"
+                    )
+
+                    # Alerta se alguma etapa for incomumente lenta
+                    if t_disk_ms > 50:
+                        logger.warning(f"[{config.name}] GARGALO DISCO: {t_disk_ms:.1f}ms (frame={frame_path})")
+                    if t_analyze_ms > 100:
+                        logger.warning(f"[{config.name}] GARGALO ANALISE: {t_analyze_ms:.1f}ms "
+                                       f"(pellets={analysis['total_pellets']})")
+                    if t_infer_ms > 300:
+                        logger.warning(f"[{config.name}] GARGALO INFERENCIA: {t_infer_ms:.1f}ms")
+
+                    # Acumular para relatório periódico
+                    acc_frame_read_ms += t_read_ms
+                    acc_infer_ms += t_infer_ms
+                    acc_analyze_ms += t_analyze_ms
+                    acc_csv_ms += t_csv_ms
+                    acc_disk_ms += t_disk_ms
+                    acc_queue_ms += t_queue_ms
+                    acc_total_pipeline_ms += t_pipeline_ms
 
                     fps_inference_count += 1
                     fps_elapsed = time.time() - fps_start_time
                     if fps_elapsed >= 5.0:
                         fps = fps_inference_count / fps_elapsed
-                        logger.info(f"[{config.name}] FPS Real: {fps:.1f} (Alvo: {target_fps}), "
-                                   f"Inferência: {inference_time:.1f}ms")
+                        avg_read = acc_frame_read_ms / fps_inference_count
+                        avg_infer = acc_infer_ms / fps_inference_count
+                        avg_analyze = acc_analyze_ms / fps_inference_count
+                        avg_csv = acc_csv_ms / fps_inference_count
+                        avg_disk = acc_disk_ms / fps_inference_count
+                        avg_queue = acc_queue_ms / fps_inference_count
+                        avg_total = acc_total_pipeline_ms / fps_inference_count
+
+                        logger.info(
+                            f"[{config.name}] --- RESUMO 5s --- "
+                            f"FPS={fps:.1f} (alvo={target_fps}) | "
+                            f"avg_total={avg_total:.1f}ms | "
+                            f"avg_infer={avg_infer:.1f}ms | "
+                            f"avg_analyze={avg_analyze:.1f}ms | "
+                            f"avg_disk={avg_disk:.1f}ms | "
+                            f"avg_csv={avg_csv:.1f}ms | "
+                            f"avg_read={avg_read:.1f}ms | "
+                            f"avg_queue={avg_queue:.1f}ms"
+                        )
+
                         fps_start_time = time.time()
                         fps_inference_count = 0
+                        acc_frame_read_ms = acc_infer_ms = acc_analyze_ms = 0.0
+                        acc_csv_ms = acc_disk_ms = acc_queue_ms = acc_total_pipeline_ms = 0.0
 
                 except Exception as e:
                     logger.error(f"[{config.name}] Erro na inferência: {e}")
@@ -198,7 +323,7 @@ class CameraManager:
                 cap.release()
             logger.info(f"[{config.name}] Thread finalizada")
 
-    def update_camera_config(self, camera_id, detection_rate=None, confidence=None, scale_mm_pixel=None):
+    def update_camera_config(self, camera_id, detection_rate=None, confidence=None, scale_mm_pixel=None, max_det=None, roi='_unchanged'):
         """
         Atualiza configurações de uma câmera em tempo real
 
@@ -207,6 +332,8 @@ class CameraManager:
             detection_rate: Nova taxa de inferências por segundo (opcional)
             confidence: Novo nível de confiança 0.0-1.0 (opcional)
             scale_mm_pixel: Nova escala mm/pixel (opcional)
+            max_det: Máximo de detecções por frame (opcional)
+            roi: (x,y,w,h) para definir ROI, None para limpar, '_unchanged' para não alterar
 
         Returns:
             bool: True se atualização bem-sucedida
@@ -237,6 +364,21 @@ class CameraManager:
                 if camera_id in self.analyzers:
                     self.analyzers[camera_id].scale = scale_mm_pixel
                 updated.append(f"scale={scale_mm_pixel}")
+
+            # Atualizar max_det no detector
+            if max_det is not None:
+                config.max_det = max_det
+                if camera_id in self.detectors:
+                    self.detectors[camera_id].max_det = max_det
+                updated.append(f"max_det={max_det}")
+
+            # Atualizar ROI (lido pelo loop da thread)
+            if roi != '_unchanged':
+                config.roi = roi
+                if roi is None:
+                    updated.append("roi=cleared")
+                else:
+                    updated.append(f"roi={roi}")
 
             logger.info(f"[{config.name}] Config atualizado: {', '.join(updated)}")
             return True

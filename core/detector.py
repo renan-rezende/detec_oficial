@@ -1,6 +1,7 @@
 """
 Detector de pelotas usando modelo de segmentação
-Suporta TensorRT (.engine) via Ultralytics e ONNX (.onnx) via ONNXRuntime
+Suporta TensorRT (.engine) e PyTorch (.pt) via Ultralytics
+Retorna o resultado puro do modelo, sem pós-processamento
 """
 import cv2
 import numpy as np
@@ -9,33 +10,23 @@ import time
 import os
 import torch
 from ultralytics import YOLO
-from config import DEFAULT_MODEL_INPUT_SIZE, DEFAULT_CONFIDENCE
+from config import DEFAULT_CONFIDENCE
 
 logger = logging.getLogger('PelletDetector.detector')
+
 
 class Detector:
     """Detector de pelotas usando modelo de segmentação"""
 
-    def __init__(self, model_path, device='cuda:0', confidence=DEFAULT_CONFIDENCE):
-        """
-        Inicializa o detector
-
-        Args:
-            model_path: Caminho para o modelo (.engine ou .onnx)
-            device: Device para inferência ('cuda:0', 'cuda:1', 'cpu')
-            confidence: Threshold de confiança (0.0 a 1.0)
-        """
+    def __init__(self, model_path, device='cuda:0', confidence=DEFAULT_CONFIDENCE, max_det=100):
         self.model_path = model_path
         self.device = device
         self.confidence = confidence
-        self.session = None
-        self.input_size = DEFAULT_MODEL_INPUT_SIZE
+        self.max_det = max_det
 
-        # Verificar se arquivo existe
         if not os.path.exists(model_path):
             raise FileNotFoundError(f"Modelo não encontrado: {model_path}")
 
-        # Carregar modelo
         try:
             self._load_model()
             logger.info(f"Detector inicializado com sucesso")
@@ -47,76 +38,86 @@ class Detector:
             raise
 
     def _load_model(self):
-        """Carrega o modelo (TensorRT, ONNX ou PyTorch)"""
+        """Carrega o modelo (TensorRT ou PyTorch)"""
         model_ext = os.path.splitext(self.model_path)[1].lower()
 
         if model_ext == '.engine':
             self._load_tensorrt()
-
-        elif model_ext == '.onnx':
-            self._load_onnx()
-
         elif model_ext == '.pt':
             self._load_pytorch()
-
         else:
             raise ValueError(f"Formato de modelo não suportado: {model_ext}")
 
-    def _load_onnx(self):
-        """Carrega modelo ONNX"""
-        try:
-            import onnxruntime as ort
+        # Detectar imgsz do modelo (TensorRT engines têm shape fixa)
+        self.imgsz = self._detect_imgsz()
+        logger.info(f"  imgsz detectado: {self.imgsz}")
 
-            # Configurar providers (GPU ou CPU)
-            providers = []
-            if self.device.startswith('cuda'):
-                providers.append('CUDAExecutionProvider')
-            providers.append('CPUExecutionProvider')
+        # Debug: logar atributos disponíveis para diagnóstico
+        model_inner = getattr(self.model, 'model', None)
+        if model_inner is not None:
+            bindings = getattr(model_inner, 'bindings', None)
+            if bindings is not None:
+                for name, b in bindings.items():
+                    shape = b.get('shape') if isinstance(b, dict) else getattr(b, 'shape', None)
+                    logger.debug(f"  binding '{name}': shape={shape}")
+            metadata = getattr(model_inner, 'metadata', {})
+            if metadata:
+                logger.debug(f"  metadata keys: {list(metadata.keys()) if isinstance(metadata, dict) else type(metadata)}")
 
-            logger.info(f"Tentando carregar modelo ONNX com providers: {providers}")
+    def _detect_imgsz(self):
+        """Detecta o tamanho de entrada do modelo"""
+        model_inner = getattr(self.model, 'model', None)
 
-            # Criar sessão ONNX
-            self.session = ort.InferenceSession(
-                self.model_path,
-                providers=providers
-            )
+        if model_inner is not None:
+            # 1. Tentar via input shape do TensorRT engine (mais confiável)
+            #    AutoBackend armazena bindings com shape do tensor de entrada
+            bindings = getattr(model_inner, 'bindings', None)
+            if bindings is not None:
+                for name, binding in bindings.items():
+                    shape = binding.get('shape') if isinstance(binding, dict) else getattr(binding, 'shape', None)
+                    if shape is not None and len(shape) == 4:
+                        # shape = (batch, channels, H, W)
+                        h, w = shape[2], shape[3]
+                        logger.debug(f"imgsz via TensorRT binding '{name}': {h}x{w}")
+                        return max(h, w)
 
-            # Informações do modelo
-            input_info = self.session.get_inputs()[0]
-            logger.info(f"  Input: {input_info.name}, shape: {input_info.shape}, tipo: {input_info.type}")
+            # 2. Tentar via metadata do modelo
+            metadata = getattr(model_inner, 'metadata', {})
+            if isinstance(metadata, dict) and 'imgsz' in metadata:
+                imgsz = metadata['imgsz']
+                if isinstance(imgsz, (list, tuple)):
+                    return max(imgsz)
+                return int(imgsz)
 
-            # Verificar provider ativo
-            active_provider = self.session.get_providers()[0]
-            logger.info(f"  Provider ativo: {active_provider}")
+            # 3. Tentar via atributo imgsz direto
+            if hasattr(model_inner, 'imgsz'):
+                imgsz = model_inner.imgsz
+                if isinstance(imgsz, (list, tuple)):
+                    return max(imgsz)
+                return int(imgsz)
 
-            if 'CUDA' in active_provider:
-                logger.info("  Inferência rodará na GPU")
-            else:
-                logger.warning("  Inferência rodará na CPU (pode ser lento)")
+        # 4. Tentar via overrides do YOLO
+        overrides = getattr(self.model, 'overrides', {})
+        if 'imgsz' in overrides:
+            imgsz = overrides['imgsz']
+            if isinstance(imgsz, (list, tuple)):
+                return max(imgsz)
+            return int(imgsz)
 
-            self.model_type = 'onnx'
-
-        except ImportError:
-            logger.error("onnxruntime não instalado. Execute: pip install onnxruntime-gpu")
-            raise
-        except Exception as e:
-            logger.error(f"Erro ao carregar modelo ONNX: {e}")
-            raise
+        # Fallback: 640 (padrão YOLO)
+        logger.warning("Não foi possível detectar imgsz do modelo, usando 640")
+        return 640
 
     def _load_tensorrt(self):
-        """Carrega modelo TensorRT usando Ultralytics (YOLO)"""
+        """Carrega modelo TensorRT usando Ultralytics"""
         try:
             logger.info("Limpando cache do CUDA...")
             torch.cuda.empty_cache()
 
             logger.info(f"Carregando modelo TensorRT via Ultralytics: {self.model_path}")
-
-            # O YOLO gerencia toda a memória e ponteiros automaticamente
             self.model = YOLO(self.model_path, task='segment')
-
             self.model_type = 'tensorrt'
 
-            # Log do tipo de modelo carregado pelo Ultralytics
             model_type_info = getattr(self.model, 'type', 'unknown')
             logger.info(f"  Ultralytics model type: {model_type_info}")
             logger.info("  TensorRT inicializado com sucesso (GPU CUDA Compute)")
@@ -126,7 +127,7 @@ class Detector:
             raise
 
     def _load_pytorch(self):
-        """Carrega modelo PyTorch (.pt) usando Ultralytics (YOLO)"""
+        """Carrega modelo PyTorch (.pt) usando Ultralytics"""
         try:
             if self.device.startswith('cuda'):
                 logger.info("Limpando cache do CUDA...")
@@ -135,9 +136,7 @@ class Detector:
             logger.info(f"Carregando modelo PyTorch via Ultralytics: {self.model_path}")
             logger.info(f"  Device: {self.device}")
 
-            # O YOLO gerencia o modelo automaticamente
             self.model = YOLO(self.model_path, task='segment')
-
             self.model_type = 'pytorch'
 
             if self.device == 'cpu':
@@ -149,129 +148,86 @@ class Detector:
             logger.error(f"Erro ao carregar modelo PyTorch via Ultralytics: {e}")
             raise
 
-    def preprocess(self, frame):
-        """Pré-processa frame para inferência (Usado apenas no fluxo ONNX)"""
-        input_frame = cv2.resize(frame, self.input_size)
-        input_frame = cv2.cvtColor(input_frame, cv2.COLOR_BGR2RGB)
-        input_frame = input_frame.astype(np.float32) / 255.0
-        input_frame = np.transpose(input_frame, (2, 0, 1))
-        input_frame = np.expand_dims(input_frame, axis=0)
-        return input_frame
-
-    def postprocess(self, output, original_shape):
-        """Pós-processa saída do modelo (Usado apenas no fluxo ONNX)"""
-        if len(output.shape) == 4:
-            mask = output[0, 0]
-        elif len(output.shape) == 3:
-            mask = output[0]
-        else:
-            mask = output
-
-        mask = (mask > self.confidence).astype(np.uint8)
-        mask_resized = cv2.resize(mask, (original_shape[1], original_shape[0]),
-                                  interpolation=cv2.INTER_NEAREST)
-        return mask_resized
-
     def infer(self, frame):
-        """Executa inferência em um frame"""
+        """
+        Executa inferência pura no frame, sem pós-processamento.
+
+        Returns:
+            tuple: (result, inference_time_ms)
+                - result: objeto ultralytics Results com masks e boxes individuais
+                - inference_time_ms: tempo de inferência em milissegundos
+        """
         try:
-            start_time = time.time()
-            original_shape = frame.shape[:2]
+            t_total_start = time.perf_counter()
 
-            # Inferência baseada no tipo de modelo
-            if hasattr(self, 'model_type') and self.model_type in ('tensorrt', 'pytorch'):
-                # Ultralytics faz pre e pós processamento nativamente
-                mask = self._infer_ultralytics(frame, original_shape)
+            # --- Informações do frame de entrada ---
+            frame_h, frame_w = frame.shape[:2]
+            logger.debug(f"[infer] Frame entrada: {frame_w}x{frame_h}, dtype={frame.dtype}, "
+                         f"model_type={self.model_type}, conf={self.confidence}")
+
+            # --- Tempo real do predict ---
+            t_predict_start = time.perf_counter()
+
+            if self.model_type == 'tensorrt':
+                results = self.model.predict(
+                    source=frame,
+                    half=True,
+                    conf=self.confidence,
+                    verbose=False,
+                    max_det=self.max_det,
+                    retina_masks=True,
+                    imgsz=self.imgsz
+                )
             else:
-                # Fluxo antigo de matrizes manuais para ONNX
-                input_tensor = self.preprocess(frame)
-                output = self._infer_onnx(input_tensor)
-                mask = self.postprocess(output, original_shape)
+                use_half = self.device.startswith('cuda')
+                results = self.model.predict(
+                    source=frame,
+                    device=self.device,
+                    half=use_half,
+                    conf=self.confidence,
+                    verbose=False,
+                    max_det=self.max_det,
+                    retina_masks=True,
+                    imgsz=self.imgsz
+                )
 
-            inference_time = (time.time() - start_time) * 1000  # ms
-            logger.debug(f"Inferência completada em {inference_time:.1f}ms")
+            t_predict_end = time.perf_counter()
+            predict_ms = (t_predict_end - t_predict_start) * 1000
 
-            return mask, inference_time
+            # --- Informações do resultado ---
+            result = results[0]
+            n_detections = len(result.boxes) if result.boxes is not None else 0
+            has_masks = result.masks is not None
+            mask_shape = result.masks.data.shape if has_masks else None
+
+            t_total_end = time.perf_counter()
+            total_infer_ms = (t_total_end - t_total_start) * 1000
+            overhead_ms = total_infer_ms - predict_ms
+
+            logger.debug(
+                f"[infer] predict={predict_ms:.1f}ms | overhead={overhead_ms:.1f}ms | "
+                f"total={total_infer_ms:.1f}ms | dets={n_detections} | "
+                f"masks={mask_shape}"
+            )
+
+            if predict_ms > 200:
+                logger.warning(f"[infer] LENTO: predict demorou {predict_ms:.1f}ms "
+                               f"(frame {frame_w}x{frame_h})")
+
+            return result, total_infer_ms
 
         except Exception as e:
             logger.error(f"Erro durante inferência: {e}")
             raise
 
-    def _infer_onnx(self, input_tensor):
-        """Inferência usando ONNX Runtime"""
-        if self.session is None:
-            raise RuntimeError("Modelo ONNX não carregado")
-        input_name = self.session.get_inputs()[0].name
-        output_name = self.session.get_outputs()[0].name
-        outputs = self.session.run([output_name], {input_name: input_tensor})
-        return outputs[0]
-
-    def _infer_ultralytics(self, frame, original_shape):
-        """Inferência usando YOLO (TensorRT ou PyTorch) com separação de instâncias para granulometria"""
-
-        if self.model_type == 'tensorrt':
-            # TensorRT: device já está embutido no engine, usar half para máxima performance
-            results = self.model.predict(
-                source=frame,
-                half=True,
-                conf=self.confidence,
-                max_det=100,
-                verbose=False,
-                retina_masks=True
-            )
-        else:
-            # PyTorch: especificar device explicitamente
-            use_half = self.device.startswith('cuda')
-            results = self.model.predict(
-                source=frame,
-                device=self.device,
-                half=use_half,
-                conf=self.confidence,
-                max_det=100,
-                verbose=False,
-                retina_masks=True
-            )
-
-        result = results[0]
-        # Cria uma tela preta vazia do tamanho da imagem da câmera
-        final_mask = np.zeros((original_shape[0], original_shape[1]), dtype=np.uint8)
-
-        if result.masks is not None:
-            # Pega as matrizes individuais (cada pelota separada)
-            masks = result.masks.data.cpu().numpy()
-            
-            for m in masks:
-                # Redimensiona a máscara individual para o tamanho da tela
-                m_resized = cv2.resize(m, (original_shape[1], original_shape[0]), interpolation=cv2.INTER_NEAREST)
-                m_binary = (m_resized > 0.5).astype(np.uint8)
-                
-                # 1. Adiciona a pelota na tela final
-                final_mask = np.bitwise_or(final_mask, m_binary)
-                
-                # 2. O SEGREDO: Desenha um contorno preto (0) de 1 pixel ao redor 
-                # da pelota recém-adicionada para garantir a separação física.
-                contours, _ = cv2.findContours(m_binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-                cv2.drawContours(final_mask, contours, -1, 0, 1)
-                
-            return final_mask
-        else:
-            return final_mask
-
     def cleanup(self):
         """Libera recursos da GPU explicitamente"""
         try:
-            # Limpar modelo YOLO/TensorRT
             if hasattr(self, 'model') and self.model is not None:
                 del self.model
                 self.model = None
                 logger.debug("Modelo YOLO/TensorRT liberado")
 
-            # Limpar sessão ONNX
-            if self.session is not None:
-                self.session = None
-                logger.debug("Sessão ONNX liberada")
-
-            # Forçar liberação da VRAM
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
                 logger.debug("Cache CUDA liberado")
@@ -280,5 +236,4 @@ class Detector:
             logger.warning(f"Erro ao liberar recursos: {e}")
 
     def __del__(self):
-        """Destrutor - chama cleanup"""
         self.cleanup()
