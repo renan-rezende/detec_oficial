@@ -1,9 +1,11 @@
 """
-Visualização de histórico temporal
+Visualizacao de historico temporal
+Carregamento de dados via multiprocessing.Process para nao travar a UI.
 """
 import customtkinter as ctk
 import logging
-import threading
+import multiprocessing as mp
+import queue as _queue
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.figure import Figure
@@ -18,8 +20,44 @@ from config import HISTORY_UPDATE_INTERVAL, DATA_DIR
 logger = logging.getLogger('PelletDetector.history_view')
 
 
+def _load_history_data(data_dir, result_queue):
+    """
+    Funcao top-level para carregar CSVs em processo separado.
+    Necessario ser top-level para multiprocessing no Windows (spawn).
+    """
+    try:
+        csv_files = glob.glob(os.path.join(data_dir, '*.csv'))
+        if not csv_files:
+            result_queue.put(None)
+            return
+
+        dfs = []
+        for csv_file in csv_files:
+            try:
+                df_temp = pd.read_csv(csv_file)
+                if not df_temp.empty:
+                    dfs.append(df_temp)
+            except Exception:
+                pass
+
+        if not dfs:
+            result_queue.put(None)
+            return
+
+        df = pd.concat(dfs, ignore_index=True)
+        if df.empty:
+            result_queue.put(None)
+            return
+
+        # Enviar DataFrame serializado para o processo principal
+        result_queue.put(df)
+
+    except Exception as e:
+        result_queue.put(('error', str(e)))
+
+
 class HistoryViewWindow(ctk.CTkToplevel):
-    """Janela de visualização de histórico"""
+    """Janela de visualizacao de historico"""
 
     def __init__(self, parent, camera_manager):
         super().__init__(parent)
@@ -27,22 +65,22 @@ class HistoryViewWindow(ctk.CTkToplevel):
         self.camera_manager = camera_manager
 
         # Configurar janela
-        self.title("Histórico - Tamanho Médio das Pelotas")
+        self.title("Historico - Tamanho Medio das Pelotas")
         self.geometry("1000x600")
 
         # Header
         header_frame = ctk.CTkFrame(self)
         header_frame.pack(fill="x", padx=20, pady=15)
 
-        title = ctk.CTkLabel(header_frame, text="Histórico Temporal",
+        title = ctk.CTkLabel(header_frame, text="Historico Temporal",
                             font=ctk.CTkFont(size=20, weight="bold"))
         title.pack(side="left", padx=10)
 
-        # Botões
+        # Botoes
         btn_frame = ctk.CTkFrame(header_frame)
         btn_frame.pack(side="right", padx=10)
 
-        refresh_btn = ctk.CTkButton(btn_frame, text="🔄 Atualizar", width=120,
+        refresh_btn = ctk.CTkButton(btn_frame, text="Atualizar", width=120,
                                    command=self.refresh_data)
         refresh_btn.pack(side="left", padx=5)
 
@@ -51,21 +89,21 @@ class HistoryViewWindow(ctk.CTkToplevel):
                                  fg_color="gray", hover_color="darkgray")
         close_btn.pack(side="left", padx=5)
 
-        # Filtro de câmera
+        # Filtro de camera
         filter_frame = ctk.CTkFrame(self)
         filter_frame.pack(fill="x", padx=20, pady=(0, 10))
 
-        ctk.CTkLabel(filter_frame, text="Câmera:", font=ctk.CTkFont(size=12)).pack(side="left", padx=10)
+        ctk.CTkLabel(filter_frame, text="Camera:", font=ctk.CTkFont(size=12)).pack(side="left", padx=10)
 
         self.camera_filter = ctk.CTkOptionMenu(filter_frame, values=["Todas"],
                                               command=self.on_camera_changed)
         self.camera_filter.pack(side="left", padx=5)
 
-        # Container do gráfico
+        # Container do grafico
         graph_frame = ctk.CTkFrame(self)
         graph_frame.pack(fill="both", expand=True, padx=20, pady=(0, 20))
 
-        # Criar gráfico matplotlib
+        # Criar grafico matplotlib
         self.fig = Figure(figsize=(12, 6), dpi=100, facecolor='#2b2b2b')
         self.ax = self.fig.add_subplot(111)
         self.ax.set_facecolor('#2b2b2b')
@@ -80,66 +118,65 @@ class HistoryViewWindow(ctk.CTkToplevel):
         self.canvas_widget.pack(fill="both", expand=True, padx=10, pady=10)
 
         self._refresh_running = False   # Guard contra refreshes concorrentes
+        self._result_queue = None       # Fila para receber dados do processo
 
-        # Carregar dados (em background para não travar a abertura da janela)
+        # Carregar dados (em background para nao travar a abertura da janela)
         self.refresh_data()
 
         # Auto-refresh
         self.after(HISTORY_UPDATE_INTERVAL, self.auto_refresh)
 
-        logger.info("Janela de histórico aberta")
+        logger.info("Janela de historico aberta")
 
     def refresh_data(self):
         """
-        Dispara leitura de CSVs em thread background.
-        Retorna imediatamente — a UI não trava durante pd.read_csv().
+        Dispara leitura de CSVs em processo separado.
+        Retorna imediatamente — a UI nao trava durante pd.read_csv().
         """
         if self._refresh_running:
             return
         self._refresh_running = True
-        threading.Thread(
-            target=self._load_data_bg,
+
+        self._result_queue = mp.Queue()
+        p = mp.Process(
+            target=_load_history_data,
+            args=(DATA_DIR, self._result_queue),
             daemon=True,
             name="HistoryRefresh"
-        ).start()
+        )
+        p.start()
 
-    def _load_data_bg(self):
-        """Lê todos os CSVs fora da thread principal (I/O não bloqueia a UI)."""
+        # Iniciar polling da fila de resultado
+        self.after(100, self._check_result)
+
+    def _check_result(self):
+        """Verifica se o processo de carregamento retornou dados."""
+        if not self.winfo_exists():
+            self._refresh_running = False
+            return
+
+        if self._result_queue is None:
+            self._refresh_running = False
+            return
+
         try:
-            csv_files = glob.glob(os.path.join(DATA_DIR, '*.csv'))
-            if not csv_files:
-                self.after(0, self.show_empty_message)
-                return
+            result = self._result_queue.get_nowait()
 
-            dfs = []
-            for csv_file in csv_files:
-                try:
-                    df_temp = pd.read_csv(csv_file)
-                    if not df_temp.empty:
-                        dfs.append(df_temp)
-                except Exception as e:
-                    logger.warning(f"Erro ao ler {csv_file}: {e}")
+            if result is None:
+                self.show_empty_message()
+            elif isinstance(result, tuple) and result[0] == 'error':
+                self.show_error_message(result[1])
+            else:
+                self._apply_data(result)
 
-            if not dfs:
-                self.after(0, self.show_empty_message)
-                return
-
-            df = pd.concat(dfs, ignore_index=True)
-            if df.empty:
-                self.after(0, self.show_empty_message)
-                return
-
-            # Agendar atualização da UI na thread principal (Tkinter thread-safe)
-            self.after(0, lambda: self._apply_data(df))
-
-        except Exception as e:
-            logger.error(f"Erro ao carregar histórico: {e}")
-            self.after(0, lambda: self.show_error_message(str(e)))
-        finally:
             self._refresh_running = False
 
+        except _queue.Empty:
+            # Ainda processando — verificar novamente em 100ms
+            self.after(100, self._check_result)
+
     def _apply_data(self, df):
-        """Atualiza widgets e redesenha gráfico — chamado sempre na thread principal."""
+        """Atualiza widgets e redesenha grafico — chamado sempre na thread principal."""
         if not self.winfo_exists():
             return
         cameras = ["Todas"] + sorted(df['camera_name'].unique().tolist())
@@ -147,20 +184,20 @@ class HistoryViewWindow(ctk.CTkToplevel):
         self.plot_history(df)
 
     def on_camera_changed(self, camera_name):
-        """Callback quando câmera é alterada"""
+        """Callback quando camera e alterada"""
         self.refresh_data()
 
     def plot_history(self, df):
         """
-        Plota gráfico de histórico
+        Plota grafico de historico
 
         Args:
-            df: DataFrame com histórico
+            df: DataFrame com historico
         """
-        # Limpar gráfico
+        # Limpar grafico
         self.ax.clear()
 
-        # Filtrar por câmera se necessário
+        # Filtrar por camera se necessario
         selected_camera = self.camera_filter.get()
         if selected_camera != "Todas":
             df = df[df['camera_name'] == selected_camera]
@@ -175,7 +212,7 @@ class HistoryViewWindow(ctk.CTkToplevel):
         # Ordenar por data
         df = df.sort_values('Data')
 
-        # Agrupar por câmera e plotar
+        # Agrupar por camera e plotar
         cameras = df['camera_name'].unique()
 
         for camera in cameras:
@@ -188,8 +225,8 @@ class HistoryViewWindow(ctk.CTkToplevel):
 
         # Configurar eixos
         self.ax.set_xlabel('Tempo', color='white', fontsize=12, fontweight='bold')
-        self.ax.set_ylabel('Tamanho Médio (mm)', color='white', fontsize=12, fontweight='bold')
-        self.ax.set_title('Evolução Temporal do Tamanho Médio das Pelotas',
+        self.ax.set_ylabel('Tamanho Medio (mm)', color='white', fontsize=12, fontweight='bold')
+        self.ax.set_title('Evolucao Temporal do Tamanho Medio das Pelotas',
                          color='white', fontsize=14, fontweight='bold', pad=20)
 
         # Formatar datas no eixo X — adapta ao span real dos dados
@@ -212,13 +249,13 @@ class HistoryViewWindow(ctk.CTkToplevel):
         # Ajustar layout
         self.fig.tight_layout()
 
-        # draw_idle() agenda o redraw no próximo evento idle do Tk (não bloqueia)
+        # draw_idle() agenda o redraw no proximo evento idle do Tk (nao bloqueia)
         self.canvas.draw_idle()
 
     def show_empty_message(self):
         """Mostra mensagem de dados vazios"""
         self.ax.clear()
-        self.ax.text(0.5, 0.5, 'Nenhum dado disponível',
+        self.ax.text(0.5, 0.5, 'Nenhum dado disponivel',
                     ha='center', va='center', fontsize=16, color='white',
                     transform=self.ax.transAxes)
         self.ax.axis('off')
@@ -234,7 +271,7 @@ class HistoryViewWindow(ctk.CTkToplevel):
         self.canvas.draw_idle()
 
     def auto_refresh(self):
-        """Auto-refresh periódico"""
+        """Auto-refresh periodico"""
         if self.winfo_exists():
             self.refresh_data()
             self.after(HISTORY_UPDATE_INTERVAL, self.auto_refresh)

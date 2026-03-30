@@ -1,15 +1,14 @@
 """
-Logger para gravação de detecções em CSV.
-Escrita assíncrona via fila: log() retorna imediatamente sem tocar o disco,
-liberando a thread PostProc para o próximo frame.
-Um único thread daemon drena a fila e grava em batch (uma abertura de arquivo
-por lote em vez de uma por linha).
+Logger para gravacao de deteccoes em CSV.
+Escrita sincrona com buffer: log() acumula linhas em memoria e grava em batch
+a cada 0.5s (uma abertura de arquivo por lote em vez de uma por linha).
+Nao usa threads — projetado para rodar dentro de um processo dedicado
+(Pipeline worker) onde nao ha contencao de GIL.
 """
 import csv
 import os
 import logging
-import queue
-import threading
+import time
 import pandas as pd
 from datetime import datetime
 from config import CSV_PATH, CSV_COLUMNS, DATA_DIR, RANGE_ORDER
@@ -17,22 +16,22 @@ from config import CSV_PATH, CSV_COLUMNS, DATA_DIR, RANGE_ORDER
 
 logger = logging.getLogger('PelletDetector.csv_logger')
 
-# Sentinela para encerrar o writer thread
-_STOP = object()
+# Intervalo maximo entre flushes (segundos)
+_FLUSH_INTERVAL = 0.5
 
 
 class CSVLogger:
-    """Gerencia gravação assíncrona de estatísticas em CSV."""
+    """Gerencia gravacao de estatisticas em CSV com buffer em memoria."""
 
     def __init__(self, csv_path=CSV_PATH):
         self.csv_path = csv_path
-        self._write_queue = queue.Queue()
-        self._lock = threading.Lock()   # Protege operações de leitura/clear
+        self._buffer = []
+        self._last_flush = time.monotonic()
 
-        # Criar diretório se não existir
+        # Criar diretorio se nao existir
         os.makedirs(DATA_DIR, exist_ok=True)
 
-        # Criar CSV com cabeçalho se não existir
+        # Criar CSV com cabecalho se nao existir
         if not os.path.exists(csv_path):
             with open(csv_path, 'w', newline='', encoding='utf-8') as f:
                 csv.writer(f).writerow(CSV_COLUMNS)
@@ -40,65 +39,14 @@ class CSVLogger:
         else:
             logger.info(f"CSV existente encontrado: {csv_path}")
 
-        # Thread daemon que grava linhas acumuladas em batch
-        self._writer_thread = threading.Thread(
-            target=self._background_writer,
-            daemon=True,
-            name=f"CSVWriter-{os.path.basename(csv_path)}"
-        )
-        self._writer_thread.start()
-
     # =========================================================================
-    #  ESCRITA ASSÍNCRONA
+    #  ESCRITA COM BUFFER
     # =========================================================================
-
-    def _background_writer(self):
-        """
-        Drena a fila em batch: espera a primeira linha, depois coleta todas
-        as que chegaram enquanto aguardava (burst draining).
-        Uma abertura de arquivo por lote é muito mais eficiente que
-        uma abertura por linha no Xeon E5-2603 v3.
-        """
-        while True:
-            rows = []
-            try:
-                # Bloqueia até a primeira linha (ou sentinela de parada)
-                item = self._write_queue.get(timeout=0.5)
-                if item is _STOP:
-                    break
-                rows.append(item)
-
-                # Coleta linhas adicionais sem bloquear (burst draining)
-                while True:
-                    try:
-                        item = self._write_queue.get_nowait()
-                        if item is _STOP:
-                            self._flush_rows(rows)
-                            return
-                        rows.append(item)
-                    except queue.Empty:
-                        break
-
-            except queue.Empty:
-                continue
-
-            self._flush_rows(rows)
-
-    def _flush_rows(self, rows):
-        """Grava uma lista de linhas de uma só vez (uma abertura de arquivo)."""
-        if not rows:
-            return
-        try:
-            with open(self.csv_path, 'a', newline='', encoding='utf-8') as f:
-                csv.writer(f).writerows(rows)
-            logger.debug(f"Batch gravado: {len(rows)} linha(s)")
-        except Exception as e:
-            logger.error(f"Erro no background writer: {e}")
 
     def log(self, camera_name, analysis_result):
         """
-        Enfileira um registro para gravação assíncrona.
-        Retorna imediatamente — não toca o disco.
+        Acumula um registro no buffer. Grava em disco automaticamente
+        quando o intervalo de flush e atingido.
         """
         try:
             row = [
@@ -110,16 +58,37 @@ class CSVLogger:
             row.extend(
                 round(analysis_result['range_relations'][r], 4) for r in RANGE_ORDER
             )
-            self._write_queue.put(row)
+            self._buffer.append(row)
+
+            # Auto-flush baseado em tempo
+            now = time.monotonic()
+            if (now - self._last_flush) >= _FLUSH_INTERVAL:
+                self.flush()
+
         except Exception as e:
             logger.error(f"Erro ao enfileirar CSV: {e}")
 
+    def flush(self):
+        """Grava todas as linhas acumuladas no buffer de uma so vez."""
+        if not self._buffer:
+            self._last_flush = time.monotonic()
+            return
+        try:
+            with open(self.csv_path, 'a', newline='', encoding='utf-8') as f:
+                csv.writer(f).writerows(self._buffer)
+            logger.debug(f"Batch gravado: {len(self._buffer)} linha(s)")
+        except Exception as e:
+            logger.error(f"Erro no flush CSV: {e}")
+        finally:
+            self._buffer.clear()
+            self._last_flush = time.monotonic()
+
     # =========================================================================
-    #  LEITURA / MANUTENÇÃO
+    #  LEITURA / MANUTENCAO
     # =========================================================================
 
     def read_csv(self):
-        """Lê o CSV completo (síncrono, uso esporádico)."""
+        """Le o CSV completo (sincrono, uso esporadico)."""
         try:
             return pd.read_csv(self.csv_path) if os.path.exists(self.csv_path) else pd.DataFrame(columns=CSV_COLUMNS)
         except Exception as e:
@@ -127,7 +96,7 @@ class CSVLogger:
             return pd.DataFrame(columns=CSV_COLUMNS)
 
     def get_history_for_camera(self, camera_name, limit=None):
-        """Retorna histórico de uma câmera específica."""
+        """Retorna historico de uma camera especifica."""
         df = self.read_csv()
         if df.empty:
             return df
@@ -137,30 +106,23 @@ class CSVLogger:
         return df_camera
 
     def get_latest_stats(self, camera_name):
-        """Retorna último registro de uma câmera, ou None."""
+        """Retorna ultimo registro de uma camera, ou None."""
         df = self.get_history_for_camera(camera_name, limit=1)
         return None if df.empty else df.iloc[-1].to_dict()
 
     def clear(self):
         """
-        Limpa todo o conteúdo do CSV (mantém cabeçalho).
-        Descarta escritas pendentes na fila antes de limpar o arquivo.
+        Limpa todo o conteudo do CSV (mantem cabecalho).
+        Descarta linhas pendentes no buffer antes de limpar o arquivo.
         """
-        # Descartar escritas pendentes na fila
-        discarded = 0
-        while not self._write_queue.empty():
-            try:
-                self._write_queue.get_nowait()
-                discarded += 1
-            except queue.Empty:
-                break
+        discarded = len(self._buffer)
+        self._buffer.clear()
         if discarded:
-            logger.debug(f"Clear: {discarded} linha(s) descartada(s) da fila")
+            logger.debug(f"Clear: {discarded} linha(s) descartada(s) do buffer")
 
-        with self._lock:
-            try:
-                with open(self.csv_path, 'w', newline='', encoding='utf-8') as f:
-                    csv.writer(f).writerow(CSV_COLUMNS)
-                logger.info("CSV limpo")
-            except Exception as e:
-                logger.error(f"Erro ao limpar CSV: {e}")
+        try:
+            with open(self.csv_path, 'w', newline='', encoding='utf-8') as f:
+                csv.writer(f).writerow(CSV_COLUMNS)
+            logger.info("CSV limpo")
+        except Exception as e:
+            logger.error(f"Erro ao limpar CSV: {e}")

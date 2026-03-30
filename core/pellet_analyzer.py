@@ -6,15 +6,42 @@ import cv2
 import numpy as np
 import logging
 import time
-import os as _os
-from concurrent.futures import ThreadPoolExecutor
+import os
 from config import GRANULOMETRIC_RANGES, RANGE_ORDER
 
 
-def _resize_mask(args):
-    """Função de nível de módulo para uso no ThreadPoolExecutor."""
-    mask, target_w, target_h = args
-    return cv2.resize(mask, (target_w, target_h), interpolation=cv2.INTER_NEAREST)
+# =========================================================================
+#  FUNCOES NUMPY — hot-paths de processamento pixel-a-pixel
+# =========================================================================
+
+def _compute_areas_from_masks(masks_data, n_masks, threshold=0.5):
+    """
+    Binariza mascaras e calcula area (contagem de pixels) via NumPy vetorizado.
+    """
+    return (masks_data > threshold).reshape(n_masks, -1).sum(axis=1).astype(np.int64)
+
+
+def _compute_edge_map(any_coverage, mask_indices, h, w):
+    """
+    Calcula o mapa de bordas entre mascaras usando operacoes NumPy vetorizadas.
+    Compara pixels vizinhos (horizontal e vertical) para detectar transicoes.
+    """
+    # Criar label_map: pixels cobertos recebem (indice + 1), nao cobertos recebem 0
+    label_map = np.where(any_coverage, mask_indices + 1, 0).astype(np.int32)
+
+    edge_map = np.zeros((h, w), dtype=np.uint8)
+
+    # Diferencas horizontais (vizinho da direita)
+    diff_h = label_map[:, :-1] != label_map[:, 1:]
+    edge_map[:, :-1] |= diff_h.astype(np.uint8)
+    edge_map[:, 1:] |= diff_h.astype(np.uint8)
+
+    # Diferencas verticais (vizinho de baixo)
+    diff_v = label_map[:-1, :] != label_map[1:, :]
+    edge_map[:-1, :] |= diff_v.astype(np.uint8)
+    edge_map[1:, :] |= diff_v.astype(np.uint8)
+
+    return edge_map
 
 
 logger = logging.getLogger('PelletDetector.analyzer')
@@ -22,16 +49,6 @@ logger = logging.getLogger('PelletDetector.analyzer')
 
 class PelletAnalyzer:
     """Analisa resultados de segmentacao e classifica pelotas"""
-
-    # Pool compartilhado entre todas as instâncias — criado uma única vez.
-    # cv2.resize() libera o GIL, então threads realmente rodam em paralelo.
-    # Usa no máximo metade dos núcleos disponíveis (deixa cores para o pipeline).
-    _resize_pool = ThreadPoolExecutor(
-        max_workers=max(1, min((_os.cpu_count() or 2) // 2, 4)),
-        thread_name_prefix="MaskResize"
-    )
-    # Número mínimo de máscaras para compensar o overhead do pool (~1-2ms)
-    _PARALLEL_RESIZE_THRESHOLD = 8
 
     def __init__(self, scale_mm_per_pixel, min_area=50):
         self.scale = scale_mm_per_pixel
@@ -55,6 +72,13 @@ class PelletAnalyzer:
         """
         Analisa resultado do YOLO extraindo informacoes de cada pelota individual.
         Versao otimizada com operacoes vetorizadas em batch.
+
+        Estrategia de resolucao:
+        - Quando frame e fornecido E mascaras sao grandes (>= 400px), opera a 1/4
+          da resolucao (DS=4): reduz 16x o volume de dados sem perda visual.
+        - Quando mascaras sao pequenas (YOLO native ~160px), usa resolucao original.
+        - A anotacao faz upsample apenas do label map (muito mais barato que
+          redimensionar 73 mascaras individuais).
 
         Args:
             result: Objeto ultralytics Results (saida direta do modelo)
@@ -107,48 +131,45 @@ class PelletAnalyzer:
         t_bin_start = time.perf_counter()
 
         if frame is not None:
-            # --- Caminho COM anotacao: resolucao cheia para overlay/contornos ---
-            masks_binary = (masks_data > 0.5).astype(np.uint8)  # (N, H, W)
+            # --- Caminho COM anotacao ---
+            # Determinar fator de downsample: opera a 1/4 quando mascaras sao grandes.
+            # Mascaras >= 400px ja estao em alta resolucao (resize=NAO ou semelhante).
+            # Mascaras pequenas (~160px, YOLO native) nao precisam de downsample.
+            _DS = 4 if (mask_h >= 400 and mask_w >= 400) else 1
+
+            work_data = masks_data[:, ::_DS, ::_DS] if _DS > 1 else masks_data
+
+            # Binarizacao + contagem de area vetorizada
+            areas_raw = _compute_areas_from_masks(work_data, n_raw_masks)
+            # masks_binary ainda necessario para anotacao (centroide + overlay)
+            masks_binary = (work_data > 0.5).astype(np.uint8)
             t_bin_ms = (time.perf_counter() - t_bin_start) * 1000
 
             t_resize_start = time.perf_counter()
-            needs_resize = (mask_h != target_h or mask_w != target_w)
-            if needs_resize:
-                resized = np.empty((n_raw_masks, target_h, target_w), dtype=np.uint8)
-                if n_raw_masks >= self._PARALLEL_RESIZE_THRESHOLD:
-                    # Resize paralelo: cv2.resize libera o GIL → threads realmente
-                    # rodam em paralelo, reduzindo ~4x o tempo com 4 workers.
-                    args = [(masks_binary[i], target_w, target_h) for i in range(n_raw_masks)]
-                    for i, result in enumerate(self._resize_pool.map(_resize_mask, args)):
-                        resized[i] = result
-                else:
-                    for i in range(n_raw_masks):
-                        resized[i] = cv2.resize(
-                            masks_binary[i], (target_w, target_h),
-                            interpolation=cv2.INTER_NEAREST
-                        )
-                masks_binary = resized
-                logger.debug(f"[analyze] Resize necessario: ({mask_h},{mask_w}) -> ({target_h},{target_w})")
-            t_resize_ms = (time.perf_counter() - t_resize_start) * 1000
+            needs_resize = _DS > 1  # indica que usamos resolucao reduzida
+            t_resize_ms = 0.0
 
             t_area_start = time.perf_counter()
-            areas = masks_binary.reshape(n_raw_masks, -1).sum(axis=1)  # (N,)
+            # Escalar contagem de pixels de volta para resolucao original
+            areas = areas_raw.astype(np.float32) * (_DS * _DS)
             t_area_ms = (time.perf_counter() - t_area_start) * 1000
         else:
-            # --- Caminho SEM anotacao: downsample 4x (112M -> 7M elementos) ---
+            # --- Caminho SEM anotacao: downsample 4x ---
             ds = 4
             small_data = masks_data[:, ::ds, ::ds]
-            masks_binary_small = (small_data > 0.5).astype(np.uint8)
+
+            # Binarizacao + contagem de area vetorizada
+            areas_raw = _compute_areas_from_masks(small_data, n_raw_masks)
             t_bin_ms = (time.perf_counter() - t_bin_start) * 1000
 
             t_resize_ms = 0.0
             needs_resize = False
 
             t_area_start = time.perf_counter()
-            areas = masks_binary_small.reshape(n_raw_masks, -1).sum(axis=1) * (ds * ds)
+            areas = areas_raw.astype(np.float32) * (ds * ds)
             t_area_ms = (time.perf_counter() - t_area_start) * 1000
 
-            masks_binary = None  # Nao precisamos do array full-res
+            masks_binary = None  # Nao precisamos do array para anotacao
 
         # --- Filtrar por area minima ---
         valid_mask = areas >= self.min_area
@@ -175,26 +196,30 @@ class PelletAnalyzer:
         diameters_mm = diameters_px * self.scale
         t_diam_ms = (time.perf_counter() - t_diam_start) * 1000
 
-        # --- Centroide (apenas quando frame e fornecido para anotacao) ---
+        # --- Centroide ---
         t_centroid_start = time.perf_counter()
 
         if frame is not None:
-            # Downsampling 4x: reduz volume de dados de ~112M para ~7M elementos
-            ds = 4
-            small_masks = valid_masks[:, ::ds, ::ds].astype(np.float32)
-            small_h, small_w = small_masks.shape[1], small_masks.shape[2]
+            # valid_masks esta no espaco reduzido (_DS x menor que o frame original).
+            # Calculamos centroides nesse espaco e escalamos para coordenadas do frame.
+            small_h_m, small_w_m = valid_masks.shape[1], valid_masks.shape[2]
+            # Fator real de escala (pode nao ser inteiro se mask_h nao divide target_h)
+            scale_y = target_h / small_h_m
+            scale_x = target_w / small_w_m
 
-            col_sums = small_masks.sum(axis=1)  # (M, small_W)
-            row_sums = small_masks.sum(axis=2)  # (M, small_H)
+            small_masks_float = valid_masks.astype(np.float32)
+            col_sums = small_masks_float.sum(axis=1)  # (M, small_W)
+            row_sums = small_masks_float.sum(axis=2)  # (M, small_H)
 
-            small_areas = small_masks.reshape(len(valid_indices), -1).sum(axis=1)
-            small_areas = np.maximum(small_areas, 1.0)  # evitar divisao por zero
+            small_areas_c = small_masks_float.reshape(len(valid_indices), -1).sum(axis=1)
+            small_areas_c = np.maximum(small_areas_c, 1.0)
 
-            x_coords = np.arange(small_w, dtype=np.float32) * ds + ds * 0.5
-            y_coords = np.arange(small_h, dtype=np.float32) * ds + ds * 0.5
+            # Coordenadas em pixels do frame original
+            x_coords = np.arange(small_w_m, dtype=np.float32) * scale_x + scale_x * 0.5
+            y_coords = np.arange(small_h_m, dtype=np.float32) * scale_y + scale_y * 0.5
 
-            cx = (col_sums @ x_coords) / small_areas
-            cy = (row_sums @ y_coords) / small_areas
+            cx = (col_sums @ x_coords) / small_areas_c
+            cy = (row_sums @ y_coords) / small_areas_c
         else:
             # Sem anotacao: centroides nao sao necessarios
             n_valid = len(valid_indices)
@@ -282,65 +307,65 @@ class PelletAnalyzer:
 
     def _annotate_frame_batch(self, frame, pellets, masks):
         """
-        Anotacao otimizada: colore mascaras em batch e desenha contornos.
-        Evita overlay[mask_bool] = color em loop Python.
+        Anotacao otimizada: label map calculado na resolucao das mascaras
+        (possivelmente 1/4 do frame) e upsampled para o frame — evita operacoes
+        de max/argmax em arrays de 150MB.
+
+        - cv2.addWeighted substitui blend float32 manual (SIMD nativo, sem alloc float).
+        - Deteccao de bordas no espaco reduzido, upsample por INTER_NEAREST.
 
         Args:
             frame: Frame original (sera copiado internamente)
             pellets: Lista de dicts com info das pelotas
-            masks: Array (M, H, W) uint8 com mascaras binarias
+            masks: Array (M, H_m, W_m) uint8 — pode estar em resolucao reduzida
         """
         n = len(pellets)
         if n == 0:
             return frame.copy()
 
         result_frame = frame.copy()
+        h, w = result_frame.shape[:2]
+        mask_h_m, mask_w_m = masks.shape[1], masks.shape[2]
 
         # Cores deterministicas
         np.random.seed(42)
         colors = np.random.randint(50, 255, size=(n, 3), dtype=np.uint8)
 
+        # --- Label map na resolucao das mascaras (muito menor que o frame) ---
+        # max(axis=0) e argmax(axis=0): O(M * H_m * W_m) — 16x mais rapido que full-res
+        any_cov_small = masks.max(axis=0).astype(bool)      # (H_m, W_m)
+        idx_small = masks.argmax(axis=0).astype(np.int32)   # (H_m, W_m)
+
+        # --- Upsample para resolucao do frame (se necessario) ---
+        if mask_h_m != h or mask_w_m != w:
+            any_coverage = cv2.resize(
+                any_cov_small.view(np.uint8), (w, h), interpolation=cv2.INTER_NEAREST
+            ).astype(bool)
+            mask_indices = cv2.resize(idx_small, (w, h), interpolation=cv2.INTER_NEAREST)
+        else:
+            any_coverage = any_cov_small
+            mask_indices = idx_small
+
         # --- Colorir mascaras em batch ---
-        # Encontrar cobertura e indice da mascara por pixel usando argmax
-        # Para pixels sem cobertura, argmax retorna 0, mas usamos any_coverage para filtrar
-        any_coverage = masks.max(axis=0).astype(bool)  # (H, W)
-        mask_indices = masks.argmax(axis=0)  # (H, W) - indice da primeira mascara ativa
+        color_overlay = colors[mask_indices]  # (H, W, 3) via fancy indexing
 
-        # Mapear indices para cores: (H, W) -> (H, W, 3)
-        color_overlay = colors[mask_indices]  # fancy indexing broadcast
+        # Alpha blend com cv2.addWeighted (uint8 SIMD, sem conversao float32)
+        # Pixels nao cobertos: overlay == result_frame → blend resulta no valor original
+        covered_3d = any_coverage[:, :, np.newaxis]  # (H, W, 1) broadcast para (H, W, 3)
+        overlay = result_frame.copy()
+        np.copyto(overlay, color_overlay, where=covered_3d)
+        cv2.addWeighted(overlay, 0.4, result_frame, 0.6, 0, result_frame)
 
-        # Blend apenas nos pixels cobertos por mascaras
-        alpha = 0.4
-        covered = any_coverage[:, :, np.newaxis]  # (H, W, 1)
-        blended = np.where(
-            covered,
-            (alpha * color_overlay.astype(np.float32) +
-             (1 - alpha) * result_frame.astype(np.float32)).astype(np.uint8),
-            result_frame
-        )
-        result_frame = blended
+        # --- Contornos via deteccao de bordas (NumPy vetorizado) ---
+        any_cov_contiguous = np.ascontiguousarray(any_coverage)
+        midx_contiguous = np.ascontiguousarray(mask_indices.astype(np.int32))
+        edge_map = _compute_edge_map(any_cov_contiguous, midx_contiguous, h, w)
 
-        # --- Contornos vetorizados via deteccao de bordas no label map ---
-        # Em vez de cv2.findContours por mascara (N chamadas OpenCV lentas),
-        # detectamos bordas comparando labels de pixels vizinhos: O(H*W) em vez de O(N*H*W)
-        h, w = result_frame.shape[:2]
-        label_map = np.where(any_coverage, mask_indices.astype(np.int16) + 1, np.int16(0))
-
-        # Bordas: pixels onde vizinhos tem labels diferentes (4-connected)
-        diff_v = label_map[:-1, :] != label_map[1:, :]
-        diff_h = label_map[:, :-1] != label_map[:, 1:]
-
-        edge_map = np.zeros((h, w), dtype=np.uint8)
-        edge_map[:-1, :] |= diff_v
-        edge_map[1:, :] |= diff_v
-        edge_map[:, :-1] |= diff_h
-        edge_map[:, 1:] |= diff_h
-
-        # Dilatar para espessura ~2px (equivalente ao thickness=2 original)
+        # Dilatar para espessura ~2px
         edge_map = cv2.dilate(edge_map, np.ones((3, 3), np.uint8))
         result_frame[edge_map > 0] = (0, 255, 0)
 
-        # --- Labels de diametro (outline em vez de getTextSize+rectangle) ---
+        # --- Labels de diametro ---
         for idx in range(n):
             pellet = pellets[idx]
             px, py = pellet['center']

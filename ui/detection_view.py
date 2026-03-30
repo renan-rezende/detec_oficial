@@ -11,7 +11,7 @@ Otimizações aplicadas:
 import customtkinter as ctk
 import cv2
 import numpy as np
-from PIL import Image, ImageTk
+from PIL import Image
 import logging
 import time
 import matplotlib.pyplot as plt
@@ -242,12 +242,13 @@ class DetectionViewFrame(ctk.CTkFrame):
 
         frame_resized = cv2.resize(frame_rgb, (new_width, new_height))
 
-        # Converter para PhotoImage
-        image = Image.fromarray(frame_resized)
-        photo = ImageTk.PhotoImage(image=image)
-
-        self.video_label.configure(image=photo, text="")
-        self.video_label.image = photo  # Manter referência (evita GC)
+        # Converter para CTkImage (evita warning de HiDPI e mantém referência automaticamente)
+        ctk_image = ctk.CTkImage(
+            light_image=Image.fromarray(frame_resized),
+            size=(new_width, new_height)
+        )
+        self.video_label.configure(image=ctk_image, text="")
+        self.video_label.image = ctk_image  # Manter referência (evita GC)
 
     # =========================================================================
     #  GRÁFICO DE BARRAS — atualização incremental

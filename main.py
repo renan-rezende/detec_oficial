@@ -1,20 +1,21 @@
 """
 Ponto de entrada do aplicativo Pellet Detector
-Sistema de detecção e medição de pelotas de minério
+Sistema de deteccao e medicao de pelotas de minerio
 """
 import sys
 import os
 import logging
+import multiprocessing as mp
 
-# Adicionar diretório do projeto ao path
+# Adicionar diretorio do projeto ao path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 # Desabilitar chamadas de rede do ultralytics ANTES de qualquer import
-# Obrigatório para ambientes sem internet (servidores industriais)
+# Obrigatorio para ambientes sem internet (servidores industriais)
 os.environ['YOLO_OFFLINE'] = '1'
 os.environ['ULTRALYTICS_OFFLINE'] = '1'
 
-# Nível de log: DEBUG ativado por --debug ou pela variável de ambiente PELLET_DEBUG=1
+# Nivel de log: DEBUG ativado por --debug ou pela variavel de ambiente PELLET_DEBUG=1
 _debug_mode = '--debug' in sys.argv or os.environ.get('PELLET_DEBUG', '0') == '1'
 _log_level = logging.DEBUG if _debug_mode else logging.INFO
 
@@ -23,7 +24,7 @@ from utils.logger import setup_logger
 logger = setup_logger('PelletDetector', level=_log_level)
 
 def main():
-    """Função principal"""
+    """Funcao principal"""
     try:
         logger.info("="*60)
         logger.info("Iniciando Pellet Detector")
@@ -36,7 +37,7 @@ def main():
         run_app()
 
     except KeyboardInterrupt:
-        logger.info("Aplicação interrompida pelo usuário")
+        logger.info("Aplicacao interrompida pelo usuario")
         sys.exit(0)
 
     except Exception as e:
@@ -44,4 +45,6 @@ def main():
         sys.exit(1)
 
 if __name__ == "__main__":
+    # Necessario para multiprocessing no Windows (metodo spawn)
+    mp.freeze_support()
     main()
