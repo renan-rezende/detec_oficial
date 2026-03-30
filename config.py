@@ -78,5 +78,7 @@ DEFAULT_MODEL_INPUT_SIZE = (960, 960)
 UI_UPDATE_INTERVAL = 30  # ms
 HISTORY_UPDATE_INTERVAL = 5000  # ms (5 segundos)
 
-# Configurações de threading
-MAX_QUEUE_SIZE = 10
+# Intervalo de atualizacao do frame anotado (segundos).
+# Frames intermediarios processam apenas dados (graficos/CSV), sem anotacao visual.
+FRAME_DISPLAY_INTERVAL = 0  # segundos
+

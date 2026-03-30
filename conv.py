@@ -11,8 +11,8 @@ import sys
 
 # Resolve caminhos relativos ao diretório deste script (funciona em qualquer máquina)
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-path_pt = os.path.join(BASE_DIR, 'best (5).pt')
-path_engine = os.path.join(BASE_DIR, 'best (5).pt.engine')
+path_pt = os.path.join(BASE_DIR, 'best (4).pt')
+path_engine = os.path.join(BASE_DIR, 'best (4).engine')
 
 # Verificação de ambiente
 print("--- Verificação de Ambiente ---")

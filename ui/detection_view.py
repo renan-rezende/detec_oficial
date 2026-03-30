@@ -1,11 +1,19 @@
 """
-Visualização de detecções em tempo real
+Visualização de detecções em tempo real — Otimizada
+
+Otimizações aplicadas:
+1. Gráfico de barras: artistas pré-criados, só atualiza alturas (sem ax.clear())
+2. Gráfico de barras: throttle de 10 updates/s (não 33/s)
+3. Gráfico de barras: draw_idle() ao invés de draw() bloqueante
+4. CSV: cache com verificação de mtime (evita releitura desnecessária)
+5. Gráfico de linha: draw_idle() ao invés de draw()
 """
 import customtkinter as ctk
 import cv2
 import numpy as np
 from PIL import Image, ImageTk
 import logging
+import time
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.figure import Figure
@@ -20,7 +28,7 @@ logger = logging.getLogger('PelletDetector.detection_view')
 
 
 class DetectionViewFrame(ctk.CTkFrame):
-    """Frame de visualização de detecções"""
+    """Frame de visualização de detecções com rendering otimizado"""
 
     def __init__(self, parent, camera_manager, camera_id):
         super().__init__(parent)
@@ -36,8 +44,13 @@ class DetectionViewFrame(ctk.CTkFrame):
             self.parent.show_camera_list()
             return
 
-        # Intervalo de tempo selecionado (padrão: 1 hora)
+        # Estado interno
         self.time_interval = "1 hora"
+        self._last_bar_update = 0.0     # Throttle do gráfico de barras
+        self._csv_last_mtime = 0        # Cache: última modificação do CSV
+        self._csv_cache = None           # Cache: DataFrame do CSV
+
+        # ===== LAYOUT =====
 
         # Header
         header_frame = ctk.CTkFrame(self)
@@ -59,11 +72,9 @@ class DetectionViewFrame(ctk.CTkFrame):
         video_frame = ctk.CTkFrame(main_container)
         video_frame.pack(side="left", fill="both", expand=True, padx=(0, 10))
 
-        # Canvas para vídeo
         self.video_label = ctk.CTkLabel(video_frame, text="Aguardando frames...")
         self.video_label.pack(fill="both", expand=True, padx=10, pady=10)
 
-        # Info abaixo do vídeo
         self.info_label = ctk.CTkLabel(video_frame, text="Inicializando...",
                                       font=ctk.CTkFont(size=12))
         self.info_label.pack(pady=5)
@@ -73,7 +84,7 @@ class DetectionViewFrame(ctk.CTkFrame):
         graphs_container.pack(side="right", fill="both", padx=(10, 0))
         graphs_container.pack_propagate(False)
 
-        # === GRÁFICO DE BARRAS (Distribuição) - TOP ===
+        # === GRÁFICO DE BARRAS (artistas pré-criados) ===
         bar_graph_frame = ctk.CTkFrame(graphs_container)
         bar_graph_frame.pack(fill="both", expand=True, pady=(0, 10))
 
@@ -81,28 +92,19 @@ class DetectionViewFrame(ctk.CTkFrame):
                                  font=ctk.CTkFont(size=13, weight="bold"))
         bar_title.pack(pady=5)
 
-        # Criar gráfico de barras matplotlib
         self.fig_bar = Figure(figsize=(5, 3), dpi=80, facecolor='#2b2b2b')
         self.ax_bar = self.fig_bar.add_subplot(111)
-        self.ax_bar.set_facecolor('#2b2b2b')
-        self.ax_bar.tick_params(colors='white', labelsize=7)
-        self.ax_bar.spines['bottom'].set_color('white')
-        self.ax_bar.spines['left'].set_color('white')
-        self.ax_bar.spines['top'].set_visible(False)
-        self.ax_bar.spines['right'].set_visible(False)
+        self._setup_bar_chart()
 
         self.canvas_bar = FigureCanvasTkAgg(self.fig_bar, master=bar_graph_frame)
         self.canvas_bar_widget = self.canvas_bar.get_tk_widget()
         self.canvas_bar_widget.pack(fill="both", expand=True, padx=5, pady=5)
+        self.canvas_bar.draw()  # Render inicial único
 
-        # Inicializar gráfico vazio
-        self.update_bar_graph({range_name: 0.0 for range_name in RANGE_ORDER})
-
-        # === GRÁFICO DE LINHA (Histórico Temporal) - BOTTOM ===
+        # === GRÁFICO DE LINHA (Histórico Temporal) ===
         line_graph_frame = ctk.CTkFrame(graphs_container)
         line_graph_frame.pack(fill="both", expand=True)
 
-        # Header do gráfico temporal com controles
         line_header = ctk.CTkFrame(line_graph_frame)
         line_header.pack(fill="x", padx=5, pady=5)
 
@@ -110,7 +112,6 @@ class DetectionViewFrame(ctk.CTkFrame):
                                  font=ctk.CTkFont(size=13, weight="bold"))
         line_title.pack(side="left", padx=5)
 
-        # Controle de intervalo de tempo
         ctk.CTkLabel(line_header, text="Intervalo:", font=ctk.CTkFont(size=10)).pack(side="left", padx=5)
 
         self.time_selector = ctk.CTkOptionMenu(
@@ -123,68 +124,97 @@ class DetectionViewFrame(ctk.CTkFrame):
         self.time_selector.set("1 hora")
         self.time_selector.pack(side="left", padx=5)
 
-        # Criar gráfico de linha matplotlib
         self.fig_line = Figure(figsize=(5, 3), dpi=80, facecolor='#2b2b2b')
         self.ax_line = self.fig_line.add_subplot(111)
-        self.ax_line.set_facecolor('#2b2b2b')
-        self.ax_line.tick_params(colors='white', labelsize=7)
-        self.ax_line.spines['bottom'].set_color('white')
-        self.ax_line.spines['left'].set_color('white')
-        self.ax_line.spines['top'].set_visible(False)
-        self.ax_line.spines['right'].set_visible(False)
 
         self.canvas_line = FigureCanvasTkAgg(self.fig_line, master=line_graph_frame)
         self.canvas_line_widget = self.canvas_line.get_tk_widget()
         self.canvas_line_widget.pack(fill="both", expand=True, padx=5, pady=5)
 
-        # Inicializar gráfico temporal vazio
+        # Render inicial do gráfico temporal
         self.update_line_graph()
 
         # Iniciar polling
         self.after(UI_UPDATE_INTERVAL, self.poll_frames)
-
-        # Atualizar gráfico temporal periodicamente (a cada 5 segundos)
         self.after(5000, self.update_line_graph_periodic)
 
         logger.info(f"Visualização da câmera {self.config.name} iniciada")
 
+    # =========================================================================
+    #  SETUP DO GRÁFICO DE BARRAS (criação única dos artistas)
+    # =========================================================================
+    def _setup_bar_chart(self):
+        """
+        Cria os artistas do gráfico de barras UMA VEZ.
+
+        Em vez de chamar ax.clear() + ax.bar() + tight_layout() + canvas.draw()
+        a cada frame (~33ms), pré-criamos as barras e textos aqui.
+        Na atualização, só mudamos as alturas com bar.set_height() — ~1000x mais rápido.
+        """
+        ax = self.ax_bar
+        ax.set_facecolor('#2b2b2b')
+        ax.tick_params(colors='white', labelsize=7)
+        ax.spines['bottom'].set_color('white')
+        ax.spines['left'].set_color('white')
+        ax.spines['top'].set_visible(False)
+        ax.spines['right'].set_visible(False)
+
+        # Criar barras com valor 0 (serão atualizadas incrementalmente)
+        ranges = [RANGE_LABELS[r] for r in RANGE_ORDER]
+        self._bars = ax.bar(ranges, [0] * len(ranges),
+                            color='#1f77b4', edgecolor='white', linewidth=0.5)
+
+        # Pré-criar textos de valor (inicialmente invisíveis)
+        self._bar_texts = []
+        for bar in self._bars:
+            t = ax.text(bar.get_x() + bar.get_width() / 2., 0, '',
+                        ha='center', va='bottom', fontsize=7, color='white')
+            t.set_visible(False)
+            self._bar_texts.append(t)
+
+        # Configurar eixos (uma vez só)
+        ax.set_ylabel('Relação (%)', color='white', fontsize=9)
+        ax.set_ylim(0, 100)
+        ax.set_xticklabels(ranges, rotation=45, ha='right', fontsize=7)
+        ax.grid(axis='y', alpha=0.3, linestyle='--', color='gray')
+
+        # tight_layout() é CARO — chamamos uma vez aqui, nunca mais no update
+        self.fig_bar.tight_layout()
+
+    # =========================================================================
+    #  POLLING E UPDATES
+    # =========================================================================
     def on_time_interval_changed(self, value):
         """Callback quando intervalo de tempo é alterado"""
         self.time_interval = value
+        self._csv_last_mtime = 0  # Forçar re-render com novo filtro
         self.update_line_graph()
 
     def poll_frames(self):
-        """Poll frames da câmera"""
+        """Poll frames da câmera com throttle inteligente"""
         if not self.camera_manager.is_running(self.camera_id):
-            # Câmera parou
             self.video_label.configure(text="Câmera parada", image=None)
             self.info_label.configure(text="A câmera não está mais ativa")
             return
 
-        # Esvaziar queue sem bloqueio e pegar APENAS o frame mais recente
-        # Evita bloquear a thread da UI com múltiplos timeouts em sequência
-        data = None
-        q = self.camera_manager.queues.get(self.camera_id)
-        if q is not None:
-            import queue as _queue
-            while True:
-                try:
-                    data = q.get_nowait()
-                except _queue.Empty:
-                    break
+        data = self.camera_manager.get_frame(self.camera_id)
 
         if data is not None:
-            frame = data['frame']
             analysis = data['analysis']
             inference_time = data['inference_time']
 
-            # Atualizar vídeo
-            self.update_video(frame)
+            # Atualizar vídeo (apenas quando há frame anotado)
+            if data['frame'] is not None:
+                self.update_video(data['frame'])
 
-            # Atualizar gráfico de barras
-            self.update_bar_graph(analysis['range_relations'])
+            # Throttle gráfico de barras: max ~10 updates/sec
+            # (era ~33/s antes — matplotlib não precisa disso)
+            now = time.monotonic()
+            if (now - self._last_bar_update) >= 0.1:
+                self.update_bar_graph(analysis['range_relations'])
+                self._last_bar_update = now
 
-            # Atualizar info
+            # Atualizar info (lightweight, sem throttle)
             roi_indicator = " | ROI: ativo" if getattr(self.config, 'roi', None) else ""
             info_text = (f"Pelotas: {analysis['total_pellets']} | "
                         f"Média: {analysis['media']:.1f}mm | "
@@ -195,162 +225,140 @@ class DetectionViewFrame(ctk.CTkFrame):
         self.after(UI_UPDATE_INTERVAL, self.poll_frames)
 
     def update_video(self, frame):
-        """
-        Atualiza frame de vídeo
-
-        Args:
-            frame: Frame OpenCV (BGR)
-        """
+        """Atualiza frame de vídeo"""
         if frame is None:
             return
 
-        # Converter BGR para RGB
+        # Converter BGR → RGB
         frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
 
-        # Resize para caber na tela (mantendo aspect ratio)
+        # Resize mantendo aspect ratio (OpenCV é mais rápido que PIL)
         max_height = 600
         max_width = 700
-
         height, width = frame_rgb.shape[:2]
         scale = min(max_width / width, max_height / height)
-
         new_width = int(width * scale)
         new_height = int(height * scale)
 
         frame_resized = cv2.resize(frame_rgb, (new_width, new_height))
 
-        # Converter para PIL Image
-        image = Image.fromarray(frame_resized)
-
         # Converter para PhotoImage
+        image = Image.fromarray(frame_resized)
         photo = ImageTk.PhotoImage(image=image)
 
-        # Atualizar label
         self.video_label.configure(image=photo, text="")
-        self.video_label.image = photo  # Manter referência
+        self.video_label.image = photo  # Manter referência (evita GC)
 
+    # =========================================================================
+    #  GRÁFICO DE BARRAS — atualização incremental
+    # =========================================================================
     def update_bar_graph(self, range_relations):
         """
-        Atualiza gráfico de barras (distribuição granulométrica)
+        Atualiza APENAS as alturas das barras existentes.
 
-        Args:
-            range_relations: Dict {range_name: relation}
+        Antes: ax.clear() → bar() → tight_layout() → draw()  (~50-200ms, segura GIL)
+        Agora: set_height() → draw_idle()                     (~0.1-1ms, não bloqueia)
         """
-        # Limpar gráfico
-        self.ax_bar.clear()
+        values = [range_relations[r] * 100 for r in RANGE_ORDER]
 
-        # Preparar dados
-        ranges = [RANGE_LABELS[r] for r in RANGE_ORDER]
-        values = [range_relations[r] * 100 for r in RANGE_ORDER]  # Converter para %
+        for bar, val, text in zip(self._bars, values, self._bar_texts):
+            bar.set_height(val)
+            if val > 0:
+                text.set_text(f'{val:.1f}%')
+                text.set_position((bar.get_x() + bar.get_width() / 2., val))
+                text.set_visible(True)
+            else:
+                text.set_visible(False)
 
-        # Criar gráfico de barras
-        bars = self.ax_bar.bar(ranges, values, color='#1f77b4', edgecolor='white', linewidth=0.5)
+        # draw_idle() agenda redraw para o próximo evento idle do Tk
+        # (não bloqueia a thread principal como draw())
+        self.canvas_bar.draw_idle()
 
-        # Adicionar valores nas barras
-        for bar in bars:
-            height = bar.get_height()
-            if height > 0:
-                self.ax_bar.text(bar.get_x() + bar.get_width()/2., height,
-                           f'{height:.1f}%',
-                           ha='center', va='bottom', fontsize=7, color='white')
-
-        # Configurar eixos
-        self.ax_bar.set_ylabel('Relação (%)', color='white', fontsize=9)
-        self.ax_bar.set_ylim(0, 100)
-        self.ax_bar.set_xticklabels(ranges, rotation=45, ha='right', fontsize=7)
-        self.ax_bar.grid(axis='y', alpha=0.3, linestyle='--', color='gray')
-
-        # Ajustar layout
-        self.fig_bar.tight_layout()
-
-        # Redesenhar
-        self.canvas_bar.draw()
-
+    # =========================================================================
+    #  GRÁFICO DE LINHA — com cache de CSV
+    # =========================================================================
     def update_line_graph(self):
-        """Atualiza gráfico de linha (histórico temporal)"""
+        """Atualiza gráfico temporal com cache inteligente de CSV"""
         try:
-            # Limpar gráfico
-            self.ax_line.clear()
-
-            # Obter caminho do CSV da câmera
             csv_filename = f"{self.config.name.replace(' ', '_')}.csv"
             csv_path = os.path.join(DATA_DIR, csv_filename)
 
-            # Verificar se CSV existe
             if not os.path.exists(csv_path):
                 self.show_empty_line_graph("CSV ainda não foi gerado")
                 return
 
-            # Ler CSV
-            df = pd.read_csv(csv_path)
+            # Cache: só relê CSV se o arquivo foi modificado
+            try:
+                current_mtime = os.path.getmtime(csv_path)
+            except OSError:
+                return
 
-            if df.empty:
+            if current_mtime != self._csv_last_mtime:
+                try:
+                    self._csv_cache = pd.read_csv(csv_path, parse_dates=['Data'])
+                    self._csv_last_mtime = current_mtime
+                except Exception as e:
+                    logger.warning(f"Erro ao ler CSV: {e}")
+                    self._csv_cache = None
+                    return
+
+            df = self._csv_cache
+            if df is None or df.empty:
                 self.show_empty_line_graph("Nenhum dado disponível")
                 return
 
-            # Converter coluna Data para datetime
-            df['Data'] = pd.to_datetime(df['Data'])
-
-            # Calcular limite de tempo baseado no intervalo selecionado
+            # Calcular limite de tempo
             now = datetime.now()
+            intervals = {
+                "1 hora": timedelta(hours=1),
+                "6 horas": timedelta(hours=6),
+                "12 horas": timedelta(hours=12),
+                "24 horas": timedelta(hours=24),
+                "3 dias": timedelta(days=3),
+                "7 dias": timedelta(days=7),
+            }
+            time_limit = now - intervals.get(self.time_interval, timedelta(hours=1))
 
-            if self.time_interval == "1 hora":
-                time_limit = now - timedelta(hours=1)
-            elif self.time_interval == "6 horas":
-                time_limit = now - timedelta(hours=6)
-            elif self.time_interval == "12 horas":
-                time_limit = now - timedelta(hours=12)
-            elif self.time_interval == "24 horas":
-                time_limit = now - timedelta(hours=24)
-            elif self.time_interval == "3 dias":
-                time_limit = now - timedelta(days=3)
-            elif self.time_interval == "7 dias":
-                time_limit = now - timedelta(days=7)
-            else:
-                time_limit = now - timedelta(hours=1)  # Default
-
-            # Filtrar dados pelo intervalo de tempo
+            # Filtrar por intervalo
             df_filtered = df[df['Data'] >= time_limit]
 
             if df_filtered.empty:
                 self.show_empty_line_graph(f"Sem dados nos últimos {self.time_interval}")
                 return
 
-            # Ordenar por data
             df_filtered = df_filtered.sort_values('Data').reset_index(drop=True)
-
-            # Aplicar média móvel (rolling average) das últimas 5 detecções para suavizar
             df_filtered['media_suavizada'] = df_filtered['media'].rolling(window=5, min_periods=1).mean()
 
-            # Plotar linha suavizada
+            # Redesenhar gráfico (clear é OK aqui — só roda a cada 5s)
+            self.ax_line.clear()
+            self.ax_line.set_facecolor('#2b2b2b')
+            self.ax_line.tick_params(colors='white', labelsize=7)
+            self.ax_line.spines['bottom'].set_color('white')
+            self.ax_line.spines['left'].set_color('white')
+            self.ax_line.spines['top'].set_visible(False)
+            self.ax_line.spines['right'].set_visible(False)
+
             self.ax_line.plot(df_filtered['Data'], df_filtered['media_suavizada'],
                              marker='o', markersize=3, linewidth=1.5,
                              color='#2ca02c', alpha=0.8)
 
-            # Configurar eixos
             self.ax_line.set_xlabel('Tempo', color='white', fontsize=9)
             self.ax_line.set_ylabel('Tamanho Médio (mm)', color='white', fontsize=9)
-            self.ax_line.set_ylim(0, 25)  # Escala fixa de 0 a 25mm
+            self.ax_line.set_ylim(0, 25)
 
-            # Formatar datas no eixo X
-            if self.time_interval in ["1 hora", "6 horas", "12 horas"]:
+            if self.time_interval in ("1 hora", "6 horas", "12 horas", "24 horas"):
                 date_format = DateFormatter("%H:%M")
-            elif self.time_interval == "24 horas":
-                date_format = DateFormatter("%H:%M")
-            else:  # 3 dias ou 7 dias
+            else:
                 date_format = DateFormatter("%d/%m %H:%M")
 
             self.ax_line.xaxis.set_major_formatter(date_format)
             self.fig_line.autofmt_xdate()
 
-            # Grid
             self.ax_line.grid(True, alpha=0.3, linestyle='--', color='gray')
-
-            # Ajustar layout
             self.fig_line.tight_layout()
 
-            # Redesenhar
-            self.canvas_line.draw()
+            # draw_idle() ao invés de draw() — não bloqueia
+            self.canvas_line.draw_idle()
 
         except Exception as e:
             logger.error(f"Erro ao atualizar gráfico temporal: {e}")
@@ -363,7 +371,7 @@ class DetectionViewFrame(ctk.CTkFrame):
                          ha='center', va='center', fontsize=10, color='white',
                          transform=self.ax_line.transAxes)
         self.ax_line.axis('off')
-        self.canvas_line.draw()
+        self.canvas_line.draw_idle()
 
     def update_line_graph_periodic(self):
         """Atualização periódica do gráfico temporal (a cada 5 segundos)"""

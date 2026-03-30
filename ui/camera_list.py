@@ -22,13 +22,13 @@ class EditCameraDialog(ctk.CTkToplevel):
 
         # Configurar janela
         self.title(f"Editar Câmera: {config.name}")
-        self.geometry("450x620")
+        self.geometry("450x720")
         self.resizable(False, False)
 
         # Centralizar na tela
         self.update_idletasks()
         x = (self.winfo_screenwidth() - 450) // 2
-        y = (self.winfo_screenheight() - 620) // 2
+        y = (self.winfo_screenheight() - 720) // 2
         self.geometry(f"+{x}+{y}")
 
         # Tornar modal
@@ -106,6 +106,23 @@ class EditCameraDialog(ctk.CTkToplevel):
         self.max_det_entry.insert(0, str(getattr(config, 'max_det', 100)))
         self.max_det_entry.pack(anchor="w", pady=5)
 
+        # Intervalo de exibição de frame
+        display_frame = ctk.CTkFrame(main_frame)
+        display_frame.pack(fill="x", pady=10)
+
+        ctk.CTkLabel(display_frame, text="Intervalo Exibição (s):",
+                    font=ctk.CTkFont(size=13, weight="bold")).pack(anchor="w")
+
+        display_control = ctk.CTkFrame(display_frame)
+        display_control.pack(fill="x", pady=5)
+
+        self.display_interval_entry = ctk.CTkEntry(display_control, width=150)
+        self.display_interval_entry.insert(0, str(getattr(config, 'frame_display_interval', 0)))
+        self.display_interval_entry.pack(side="left", padx=(0, 10))
+
+        ctk.CTkLabel(display_control, text="0 = todos os frames",
+                     font=ctk.CTkFont(size=11), text_color="gray").pack(side="left")
+
         # Região de Interesse (ROI)
         roi_section = ctk.CTkFrame(main_frame)
         roi_section.pack(fill="x", pady=10)
@@ -151,7 +168,7 @@ class EditCameraDialog(ctk.CTkToplevel):
 
     def _open_roi_dialog(self):
         """Abre diálogo de seleção de ROI usando frame da câmera ativa"""
-        data = self.camera_manager.get_frame(self.camera_id, timeout=0.5)
+        data = self.camera_manager.get_frame(self.camera_id)
         if data is not None:
             frame = data['frame']
         else:
@@ -199,6 +216,16 @@ class EditCameraDialog(ctk.CTkToplevel):
                 messagebox.showerror("Erro", "Máx. detecções inválido (use número inteiro)")
                 return
 
+            # Validar intervalo de exibição
+            try:
+                display_interval = float(self.display_interval_entry.get())
+                if display_interval < 0:
+                    messagebox.showerror("Erro", "Intervalo de exibição deve ser >= 0")
+                    return
+            except ValueError:
+                messagebox.showerror("Erro", "Intervalo de exibição inválido (use número)")
+                return
+
             # Obter valores
             detection_rate = int(self.rate_slider.get())
             confidence = self.conf_slider.get() / 100.0
@@ -210,7 +237,8 @@ class EditCameraDialog(ctk.CTkToplevel):
                 confidence=confidence,
                 scale_mm_pixel=scale,
                 max_det=max_det,
-                roi=self._pending_roi
+                roi=self._pending_roi,
+                frame_display_interval=display_interval
             )
 
             if success:

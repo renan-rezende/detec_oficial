@@ -3,7 +3,13 @@
     "allow": [
       "Bash(tree:*)",
       "Bash(python:*)",
-      "Bash(ls:*)"
+      "Bash(ls:*)",
+      "Bash(pip list:*)",
+      "Read(//c/Projects/SAM/**)",
+      "Bash(find \"detec_pellet_sem_opc - Copia\" -maxdepth 1 -name \"*.py\" -exec wc -l {} +)",
+      "Bash(find \"detec_pellet_sem_opc - Copia/core\" -name \"*.py\" -not -path \"*/__pycache__/*\" -exec wc -l {} +)",
+      "Bash(find \"detec_pellet_sem_opc - Copia/ui\" -name \"*.py\" -not -path \"*/__pycache__/*\" -exec wc -l {} +)",
+      "Bash(find \"detec_pellet_sem_opc - Copia/utils\" -name \"*.py\" -not -path \"*/__pycache__/*\" -exec wc -l {} +)"
     ]
   }
 }

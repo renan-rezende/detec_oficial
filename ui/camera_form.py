@@ -8,7 +8,7 @@ import os
 import logging
 from core.camera_manager import CameraConfig
 from utils.gpu_utils import get_gpu_options, parse_device_option
-from config import MODEL_PATH, DEFAULT_DETECTION_RATE, DEFAULT_SCALE_MM_PIXEL, DEFAULT_CONFIDENCE, DEFAULT_MAX_DET
+from config import MODEL_PATH, DEFAULT_DETECTION_RATE, DEFAULT_SCALE_MM_PIXEL, DEFAULT_CONFIDENCE, DEFAULT_MAX_DET, FRAME_DISPLAY_INTERVAL
 from ui.roi_dialog import ROIDialog, grab_sample_frame
 
 
@@ -102,17 +102,29 @@ class CameraFormFrame(ctk.CTkFrame):
         self.max_det_entry.insert(0, str(DEFAULT_MAX_DET))
         self.max_det_entry.grid(row=6, column=1, padx=10, pady=10, sticky="w")
 
+        # Intervalo de exibição de frame (segundos)
+        self.create_field(form_frame, "Intervalo Exibição (s):", 7)
+        display_frame = ctk.CTkFrame(form_frame)
+        display_frame.grid(row=7, column=1, padx=10, pady=10, sticky="w")
+
+        self.display_interval_entry = ctk.CTkEntry(display_frame, width=150, placeholder_text="Ex: 0")
+        self.display_interval_entry.insert(0, str(FRAME_DISPLAY_INTERVAL))
+        self.display_interval_entry.pack(side="left", padx=(0, 10))
+
+        ctk.CTkLabel(display_frame, text="0 = todos os frames",
+                     font=ctk.CTkFont(size=11), text_color="gray").pack(side="left")
+
         # Dispositivo (GPU/CPU)
-        self.create_field(form_frame, "Dispositivo:", 7)
+        self.create_field(form_frame, "Dispositivo:", 8)
         self.device_options = get_gpu_options()
         self.device_menu = ctk.CTkOptionMenu(form_frame, values=self.device_options, width=400)
         self.device_menu.set(self.device_options[0])
-        self.device_menu.grid(row=7, column=1, padx=10, pady=10, sticky="w")
+        self.device_menu.grid(row=8, column=1, padx=10, pady=10, sticky="w")
 
         # Região de Interesse (ROI)
-        self.create_field(form_frame, "Região de Interesse:", 8)
+        self.create_field(form_frame, "Região de Interesse:", 9)
         roi_frame = ctk.CTkFrame(form_frame)
-        roi_frame.grid(row=8, column=1, padx=10, pady=10, sticky="w")
+        roi_frame.grid(row=9, column=1, padx=10, pady=10, sticky="w")
 
         self.roi_status_label = ctk.CTkLabel(roi_frame, text="Não definida (frame inteiro)")
         self.roi_status_label.pack(side="left", padx=(0, 10))
@@ -256,6 +268,14 @@ class CameraFormFrame(ctk.CTkFrame):
         except ValueError:
             errors.append("Máx. detecções inválido (use número inteiro)")
 
+        # Intervalo de exibição
+        try:
+            display_interval = float(self.display_interval_entry.get())
+            if display_interval < 0:
+                errors.append("Intervalo de exibição deve ser >= 0")
+        except ValueError:
+            errors.append("Intervalo de exibição inválido (use número)")
+
         return errors
 
     def add_camera(self):
@@ -276,6 +296,7 @@ class CameraFormFrame(ctk.CTkFrame):
             scale_mm_pixel = float(self.scale_entry.get())
             confidence = self.conf_slider.get() / 100.0
             max_det = int(self.max_det_entry.get())
+            frame_display_interval = float(self.display_interval_entry.get())
             device_str = self.device_menu.get()
             device = parse_device_option(device_str)
 
@@ -289,7 +310,8 @@ class CameraFormFrame(ctk.CTkFrame):
                 confidence=confidence,
                 device=device,
                 max_det=max_det,
-                roi=self.roi_value
+                roi=self.roi_value,
+                frame_display_interval=frame_display_interval
             )
 
             # Adicionar ao manager

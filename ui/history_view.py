@@ -3,6 +3,7 @@ Visualização de histórico temporal
 """
 import customtkinter as ctk
 import logging
+import threading
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.figure import Figure
@@ -78,7 +79,9 @@ class HistoryViewWindow(ctk.CTkToplevel):
         self.canvas_widget = self.canvas.get_tk_widget()
         self.canvas_widget.pack(fill="both", expand=True, padx=10, pady=10)
 
-        # Carregar dados
+        self._refresh_running = False   # Guard contra refreshes concorrentes
+
+        # Carregar dados (em background para não travar a abertura da janela)
         self.refresh_data()
 
         # Auto-refresh
@@ -87,16 +90,27 @@ class HistoryViewWindow(ctk.CTkToplevel):
         logger.info("Janela de histórico aberta")
 
     def refresh_data(self):
-        """Atualiza dados lendo TODOS os CSVs da pasta data/"""
-        try:
-            # Ler TODOS os CSVs da pasta data/
-            csv_files = glob.glob(os.path.join(DATA_DIR, '*.csv'))
+        """
+        Dispara leitura de CSVs em thread background.
+        Retorna imediatamente — a UI não trava durante pd.read_csv().
+        """
+        if self._refresh_running:
+            return
+        self._refresh_running = True
+        threading.Thread(
+            target=self._load_data_bg,
+            daemon=True,
+            name="HistoryRefresh"
+        ).start()
 
+    def _load_data_bg(self):
+        """Lê todos os CSVs fora da thread principal (I/O não bloqueia a UI)."""
+        try:
+            csv_files = glob.glob(os.path.join(DATA_DIR, '*.csv'))
             if not csv_files:
-                self.show_empty_message()
+                self.after(0, self.show_empty_message)
                 return
 
-            # Combinar todos os CSVs em um único DataFrame
             dfs = []
             for csv_file in csv_files:
                 try:
@@ -107,26 +121,30 @@ class HistoryViewWindow(ctk.CTkToplevel):
                     logger.warning(f"Erro ao ler {csv_file}: {e}")
 
             if not dfs:
-                self.show_empty_message()
+                self.after(0, self.show_empty_message)
                 return
 
-            # Concatenar todos os DataFrames
             df = pd.concat(dfs, ignore_index=True)
-
             if df.empty:
-                self.show_empty_message()
+                self.after(0, self.show_empty_message)
                 return
 
-            # Atualizar opções de câmera
-            cameras = ["Todas"] + sorted(df['camera_name'].unique().tolist())
-            self.camera_filter.configure(values=cameras)
-
-            # Plotar
-            self.plot_history(df)
+            # Agendar atualização da UI na thread principal (Tkinter thread-safe)
+            self.after(0, lambda: self._apply_data(df))
 
         except Exception as e:
             logger.error(f"Erro ao carregar histórico: {e}")
-            self.show_error_message(str(e))
+            self.after(0, lambda: self.show_error_message(str(e)))
+        finally:
+            self._refresh_running = False
+
+    def _apply_data(self, df):
+        """Atualiza widgets e redesenha gráfico — chamado sempre na thread principal."""
+        if not self.winfo_exists():
+            return
+        cameras = ["Todas"] + sorted(df['camera_name'].unique().tolist())
+        self.camera_filter.configure(values=cameras)
+        self.plot_history(df)
 
     def on_camera_changed(self, camera_name):
         """Callback quando câmera é alterada"""
@@ -194,8 +212,8 @@ class HistoryViewWindow(ctk.CTkToplevel):
         # Ajustar layout
         self.fig.tight_layout()
 
-        # Redesenhar
-        self.canvas.draw()
+        # draw_idle() agenda o redraw no próximo evento idle do Tk (não bloqueia)
+        self.canvas.draw_idle()
 
     def show_empty_message(self):
         """Mostra mensagem de dados vazios"""
@@ -204,7 +222,7 @@ class HistoryViewWindow(ctk.CTkToplevel):
                     ha='center', va='center', fontsize=16, color='white',
                     transform=self.ax.transAxes)
         self.ax.axis('off')
-        self.canvas.draw()
+        self.canvas.draw_idle()
 
     def show_error_message(self, error):
         """Mostra mensagem de erro"""
@@ -213,7 +231,7 @@ class HistoryViewWindow(ctk.CTkToplevel):
                     ha='center', va='center', fontsize=14, color='red',
                     transform=self.ax.transAxes)
         self.ax.axis('off')
-        self.canvas.draw()
+        self.canvas.draw_idle()
 
     def auto_refresh(self):
         """Auto-refresh periódico"""
